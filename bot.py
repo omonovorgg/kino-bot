@@ -132,6 +132,20 @@ def init_db():
 init_db()
 
 
+# Default mandatory channel.
+# Owner can remove it later from Admin panel -> Kanal o'chirish.
+def ensure_default_channel():
+    if not db.execute("SELECT 1 FROM channels LIMIT 1").fetchone():
+        db.execute("""
+            INSERT OR IGNORE INTO channels(username, title, chat_id)
+            VALUES (?, ?, ?)
+        """, ("@uz_kinocinema", "KinoCinema", "@uz_kinocinema"))
+        db.commit()
+
+
+ensure_default_channel()
+
+
 # =========================================================
 # YORDAMCHI
 # =========================================================
@@ -341,6 +355,7 @@ def get_channels():
 async def check_subscription(user_id):
     channels = get_channels()
 
+    # If owner has removed all channels, subscription is not required.
     if not channels:
         return True
 
@@ -351,18 +366,23 @@ async def check_subscription(user_id):
                 user_id=user_id
             )
 
-            if member.status in ("left", "kicked"):
+            status = member.status
+
+            # These statuses mean the user is NOT subscribed.
+            if status in ("left", "kicked"):
                 return False
 
-            if (
-                member.status == "restricted"
-                and hasattr(member, "is_member")
-                and not member.is_member
-            ):
-                return False
+            # Restricted member can still be subscribed if is_member=True.
+            if status == "restricted":
+                if not getattr(member, "is_member", False):
+                    return False
 
         except Exception as e:
-            print("OBUNA TEKSHIRISH:", e)
+            print(
+                f"SUB CHECK ERROR | channel={channel['chat_id']} "
+                f"user={user_id}: {e}"
+            )
+            # If Telegram cannot verify the membership, do NOT unlock the bot.
             return False
 
     return True
@@ -379,14 +399,14 @@ def subscription_keyboard():
 
         buttons.append([
             InlineKeyboardButton(
-                text=f"ð¢ {ch['title']}",
+                text=f"📢 {ch['title']}",
                 url=f"https://t.me/{username}"
             )
         ])
 
     buttons.append([
         InlineKeyboardButton(
-            text="â Obuna bo'ldim",
+            text="✅ Obuna bo'ldim",
             callback_data="check_sub"
         )
     ])
@@ -395,19 +415,32 @@ def subscription_keyboard():
 
 
 async def require_subscription(message):
+    # Owner/admins are allowed to use the bot without subscribing.
     if is_admin_id(message.from_user.id):
         return True
 
     if await check_subscription(message.from_user.id):
         return True
 
+    # IMPORTANT:
+    # Remove the old main keyboard so an unsubscribed user cannot keep
+    # seeing/using the previous menu.
+    from aiogram.types import ReplyKeyboardRemove
+
     await message.answer(
-        "ð <b>Botdan foydalanish uchun kanalga obuna bo'ling.</b>\n\n"
-        "Quyidagi kanallarga obuna bo'lib, "
-        "Â«â Obuna bo'ldimÂ» tugmasini bosing.",
+        "🔐 <b>Avval kanalga obuna bo'ling.</b>\n\n"
+        "Botdan foydalanish uchun quyidagi kanalga obuna bo'ling "
+        "va «✅ Obuna bo'ldim» tugmasini bosing.",
+        reply_markup=ReplyKeyboardRemove(),
+        parse_mode="HTML"
+    )
+
+    await message.answer(
+        "📢 <b>Majburiy kanal:</b>",
         reply_markup=subscription_keyboard(),
         parse_mode="HTML"
     )
+
     return False
 
 
@@ -418,18 +451,18 @@ async def require_subscription(message):
 def main_menu(user_id):
     rows = [
         [
-            KeyboardButton(text="ð Kino qidirish"),
-            KeyboardButton(text="â­ Prime status")
+            KeyboardButton(text="🔎 Kino qidirish"),
+            KeyboardButton(text="⭐ Prime status")
         ],
-        [KeyboardButton(text="ð Kinolar ro'yxati")],
-        [KeyboardButton(text="ð¸ Instagramga qaytish")],
-        [KeyboardButton(text="ð¬ Kino buyurtma qilish")],
-        [KeyboardButton(text="ð¤ Reklama & Bot olish")],
+        [KeyboardButton(text="📚 Kinolar ro'yxati")],
+        [KeyboardButton(text="📸 Instagramga qaytish")],
+        [KeyboardButton(text="🎬 Kino buyurtma qilish")],
+        [KeyboardButton(text="🤝 Reklama & Bot olish")],
     ]
 
     if is_admin_id(user_id):
         rows.append([
-            KeyboardButton(text="ð¨âð» Admin panel")
+            KeyboardButton(text="👨‍💻 Admin panel")
         ])
 
     return ReplyKeyboardMarkup(
@@ -441,33 +474,33 @@ def main_menu(user_id):
 def admin_menu(user_id):
     rows = [
         [
-            KeyboardButton(text="â Kino qo'shish"),
-            KeyboardButton(text="ð Kino o'chirish")
+            KeyboardButton(text="➕ Kino qo'shish"),
+            KeyboardButton(text="🗑 Kino o'chirish")
         ],
         [
-            KeyboardButton(text="ð³ Mening kartam"),
-            KeyboardButton(text="ð Mening statistikam")
+            KeyboardButton(text="💳 Mening kartam"),
+            KeyboardButton(text="📊 Mening statistikam")
         ],
         [
-            KeyboardButton(text="ð Mening silkam")
+            KeyboardButton(text="🔗 Mening silkam")
         ],
     ]
 
     if user_id == owner_id():
         rows.extend([
-            [KeyboardButton(text="ð¥ Adminlar")],
+            [KeyboardButton(text="👥 Adminlar")],
             [
-                KeyboardButton(text="ð¢ Kanal qo'shish"),
-                KeyboardButton(text="ð Kanal o'chirish")
+                KeyboardButton(text="📢 Kanal qo'shish"),
+                KeyboardButton(text="🗑 Kanal o'chirish")
             ],
             [
-                KeyboardButton(text="ð Kanallar"),
-                KeyboardButton(text="ð Umumiy statistika")
+                KeyboardButton(text="📋 Kanallar"),
+                KeyboardButton(text="📊 Umumiy statistika")
             ],
         ])
 
     rows.append([
-        KeyboardButton(text="ð  Asosiy menyu")
+        KeyboardButton(text="🏠 Asosiy menyu")
     ])
 
     return ReplyKeyboardMarkup(
@@ -477,13 +510,13 @@ def admin_menu(user_id):
 
 
 def cancel_kb(admin=False):
-    back = "â¬ï¸ Admin panel" if admin else "â¬ï¸ Asosiy menyu"
+    back = "⬅️ Admin panel" if admin else "⬅️ Asosiy menyu"
 
     return ReplyKeyboardMarkup(
         keyboard=[
             [
                 KeyboardButton(text=back),
-                KeyboardButton(text="â Bekor qilish")
+                KeyboardButton(text="❌ Bekor qilish")
             ]
         ],
         resize_keyboard=True
@@ -539,61 +572,61 @@ class Payment(StatesGroup):
 
 
 # =========================================================
-# NAVIGATION â BU HANDLERLAR FSM HANDLERLARIDAN OLDIN
+# NAVIGATION — BU HANDLERLAR FSM HANDLERLARIDAN OLDIN
 # =========================================================
 
-@dp.message(F.text == "ð  Asosiy menyu")
+@dp.message(F.text == "🏠 Asosiy menyu")
 async def home(message: Message, state: FSMContext):
     await state.clear()
 
     await message.answer(
-        "ð  <b>Asosiy menyu</b>",
+        "🏠 <b>Asosiy menyu</b>",
         reply_markup=main_menu(message.from_user.id),
         parse_mode="HTML"
     )
 
 
-@dp.message(F.text == "â¬ï¸ Admin panel")
+@dp.message(F.text == "⬅️ Admin panel")
 async def back_admin(message: Message, state: FSMContext):
     await state.clear()
 
     if not is_admin_id(message.from_user.id):
         await message.answer(
-            "ð  Asosiy menyu:",
+            "🏠 Asosiy menyu:",
             reply_markup=main_menu(message.from_user.id)
         )
         return
 
     await message.answer(
-        "ð¨âð» <b>Admin panel</b>",
+        "👨‍💻 <b>Admin panel</b>",
         reply_markup=admin_menu(message.from_user.id),
         parse_mode="HTML"
     )
 
 
-@dp.message(F.text == "â¬ï¸ Asosiy menyu")
+@dp.message(F.text == "⬅️ Asosiy menyu")
 async def back_home(message: Message, state: FSMContext):
     await state.clear()
 
     await message.answer(
-        "ð  <b>Asosiy menyu</b>",
+        "🏠 <b>Asosiy menyu</b>",
         reply_markup=main_menu(message.from_user.id),
         parse_mode="HTML"
     )
 
 
-@dp.message(F.text == "â Bekor qilish")
+@dp.message(F.text == "❌ Bekor qilish")
 async def cancel_all(message: Message, state: FSMContext):
     await state.clear()
 
     if is_admin_id(message.from_user.id):
         await message.answer(
-            "â Jarayon bekor qilindi.",
+            "❌ Jarayon bekor qilindi.",
             reply_markup=admin_menu(message.from_user.id)
         )
     else:
         await message.answer(
-            "â Jarayon bekor qilindi.",
+            "❌ Jarayon bekor qilindi.",
             reply_markup=main_menu(message.from_user.id)
         )
 
@@ -638,7 +671,7 @@ async def start_handler(message: Message, state: FSMContext):
             return
 
     await message.answer(
-        "ð¬ <b>KinoCinema</b> botiga xush kelibsiz!\n\n"
+        "🎬 <b>KinoCinema</b> botiga xush kelibsiz!\n\n"
         "Kerakli bo'limni tanlang:",
         reply_markup=main_menu(message.from_user.id),
         parse_mode="HTML"
@@ -649,15 +682,15 @@ async def start_handler(message: Message, state: FSMContext):
 async def check_sub_callback(callback: CallbackQuery):
     if is_admin_id(callback.from_user.id):
         await callback.message.answer(
-            "ð  Asosiy menyu:",
+            "🏠 Asosiy menyu:",
             reply_markup=main_menu(callback.from_user.id)
         )
-        await callback.answer()
+        await callback.answer("Tasdiqlandi!")
         return
 
     if await check_subscription(callback.from_user.id):
         await callback.message.answer(
-            "â <b>Obuna tasdiqlandi!</b>\n\n"
+            "✅ <b>Obuna tasdiqlandi!</b>\n\n"
             "Endi botdan foydalanishingiz mumkin.",
             reply_markup=main_menu(callback.from_user.id),
             parse_mode="HTML"
@@ -665,7 +698,7 @@ async def check_sub_callback(callback: CallbackQuery):
         await callback.answer("Obuna tasdiqlandi!")
     else:
         await callback.answer(
-            "â Hali barcha kanallarga obuna bo'lmagansiz.",
+            "❌ Hali kanalga obuna bo'lmagansiz.",
             show_alert=True
         )
 
@@ -674,7 +707,7 @@ async def check_sub_callback(callback: CallbackQuery):
 # ADMIN PANEL
 # =========================================================
 
-@dp.message(F.text == "ð¨âð» Admin panel")
+@dp.message(F.text == "👨‍💻 Admin panel")
 async def admin_panel(message: Message):
     if not is_admin_id(message.from_user.id):
         return
@@ -682,7 +715,7 @@ async def admin_panel(message: Message):
     ensure_owner(message.from_user)
 
     await message.answer(
-        "ð¨âð» <b>Admin panel</b>\n\n"
+        "👨‍💻 <b>Admin panel</b>\n\n"
         "Kerakli bo'limni tanlang:",
         reply_markup=admin_menu(message.from_user.id),
         parse_mode="HTML"
@@ -697,32 +730,32 @@ def card_inline():
     return InlineKeyboardMarkup(inline_keyboard=[
         [
             InlineKeyboardButton(
-                text="â/ð Kartani kiritish",
+                text="➕/🔄 Kartani kiritish",
                 callback_data="card_add"
             )
         ],
         [
             InlineKeyboardButton(
-                text="ð Hozirgi kartani ko'rish",
+                text="👀 Hozirgi kartani ko'rish",
                 callback_data="card_view"
             )
         ],
         [
             InlineKeyboardButton(
-                text="ð Kartani o'chirish",
+                text="🗑 Kartani o'chirish",
                 callback_data="card_del"
             )
         ],
         [
             InlineKeyboardButton(
-                text="â¬ï¸ Admin panel",
+                text="⬅️ Admin panel",
                 callback_data="admin_panel_cb"
             )
         ]
     ])
 
 
-@dp.message(F.text == "ð³ Mening kartam")
+@dp.message(F.text == "💳 Mening kartam")
 async def my_card(message: Message):
     if not is_admin_id(message.from_user.id):
         return
@@ -731,17 +764,17 @@ async def my_card(message: Message):
 
     if card:
         text = (
-            "ð³ <b>Sizning kartangiz</b>\n\n"
-            f"ð³ <code>{card}</code>\n"
-            f"ð¤ {owner}\n\n"
+            "💳 <b>Sizning kartangiz</b>\n\n"
+            f"💳 <code>{card}</code>\n"
+            f"👤 {owner}\n\n"
             "Bu karta faqat sizning referral silkangizdan "
             "kelgan foydalanuvchilarga ko'rsatiladi."
         )
     else:
         text = (
-            "ð³ <b>Sizning kartangiz</b>\n\n"
-            "â Hali karta kiritilmagan.\n\n"
-            "â Kartani kiriting."
+            "💳 <b>Sizning kartangiz</b>\n\n"
+            "❌ Hali karta kiritilmagan.\n\n"
+            "➕ Kartani kiriting."
         )
 
     await message.answer(
@@ -760,7 +793,7 @@ async def card_add_start(callback: CallbackQuery, state: FSMContext):
     await state.set_state(CardAdd.number)
 
     await callback.message.answer(
-        "ð³ <b>Karta raqamini yuboring.</b>\n\n"
+        "💳 <b>Karta raqamini yuboring.</b>\n\n"
         "Masalan:\n"
         "<code>9860600435412504</code>",
         reply_markup=cancel_kb(admin=True),
@@ -779,8 +812,8 @@ async def card_number(message: Message, state: FSMContext):
 
     if not value.isdigit() or not (12 <= len(value) <= 19):
         await message.answer(
-            "â Karta raqami noto'g'ri.\n"
-            "Faqat 12â19 ta raqam yuboring.",
+            "❌ Karta raqami noto'g'ri.\n"
+            "Faqat 12–19 ta raqam yuboring.",
             reply_markup=cancel_kb(admin=True)
         )
         return
@@ -789,7 +822,7 @@ async def card_number(message: Message, state: FSMContext):
     await state.set_state(CardAdd.owner)
 
     await message.answer(
-        "ð¤ <b>Karta egasining ism-familiyasini yuboring.</b>",
+        "👤 <b>Karta egasining ism-familiyasini yuboring.</b>",
         reply_markup=cancel_kb(admin=True),
         parse_mode="HTML"
     )
@@ -805,7 +838,7 @@ async def card_owner(message: Message, state: FSMContext):
 
     if len(owner) < 2:
         await message.answer(
-            "â Ism-familiya noto'g'ri.",
+            "❌ Ism-familiya noto'g'ri.",
             reply_markup=cancel_kb(admin=True)
         )
         return
@@ -821,9 +854,9 @@ async def card_owner(message: Message, state: FSMContext):
     await state.clear()
 
     await message.answer(
-        "â <b>Karta muvaffaqiyatli saqlandi!</b>\n\n"
-        f"ð³ <code>{data['card']}</code>\n"
-        f"ð¤ {owner}\n\n"
+        "✅ <b>Karta muvaffaqiyatli saqlandi!</b>\n\n"
+        f"💳 <code>{data['card']}</code>\n"
+        f"👤 {owner}\n\n"
         "Bu faqat sizning kartangiz. Boshqa adminlarning "
         "kartasiga ta'sir qilmaydi.",
         reply_markup=admin_menu(message.from_user.id),
@@ -839,12 +872,12 @@ async def card_view(callback: CallbackQuery):
     card, owner = admin_card(callback.from_user.id)
 
     if not card:
-        text = "â Sizda hali karta kiritilmagan."
+        text = "❌ Sizda hali karta kiritilmagan."
     else:
         text = (
-            "ð³ <b>Sizning kartangiz</b>\n\n"
-            f"ð³ <code>{card}</code>\n"
-            f"ð¤ {owner}"
+            "💳 <b>Sizning kartangiz</b>\n\n"
+            f"💳 <code>{card}</code>\n"
+            f"👤 {owner}"
         )
 
     await callback.message.answer(
@@ -863,7 +896,7 @@ async def card_del(callback: CallbackQuery):
     delete_admin_card(callback.from_user.id)
 
     await callback.message.answer(
-        "ð <b>Sizning kartangiz o'chirildi.</b>",
+        "🗑 <b>Sizning kartangiz o'chirildi.</b>",
         reply_markup=card_inline(),
         parse_mode="HTML"
     )
@@ -874,7 +907,7 @@ async def card_del(callback: CallbackQuery):
 # REFERRAL LINK + STATS
 # =========================================================
 
-@dp.message(F.text == "ð Mening silkam")
+@dp.message(F.text == "🔗 Mening silkam")
 async def my_link(message: Message):
     if not is_admin_id(message.from_user.id):
         return
@@ -882,17 +915,17 @@ async def my_link(message: Message):
     link = referral_link(message.from_user.id)
 
     await message.answer(
-        "ð <b>Sizning shaxsiy referral silkangiz:</b>\n\n"
+        "🔗 <b>Sizning shaxsiy referral silkangiz:</b>\n\n"
         f"<code>{link}</code>\n\n"
-        "ð¤ Shu silka orqali kirgan foydalanuvchilar "
+        "👤 Shu silka orqali kirgan foydalanuvchilar "
         "sizga biriktiriladi.\n"
-        "ð³ Ularning Prime to'lovlari sizning kartangizga "
+        "💳 Ularning Prime to'lovlari sizning kartangizga "
         "to'lanadi va statistika sizniki bo'ladi.",
         parse_mode="HTML"
     )
 
 
-@dp.message(F.text == "ð Mening statistikam")
+@dp.message(F.text == "📊 Mening statistikam")
 async def my_stats(message: Message):
     if not is_admin_id(message.from_user.id):
         return
@@ -927,11 +960,11 @@ async def my_stats(message: Message):
     """, (aid,)).fetchone()["c"]
 
     await message.answer(
-        "ð <b>Sizning statistkangiz</b>\n\n"
-        f"ð¥ Silkangizdan kirganlar: <b>{users}</b>\n"
-        f"ð³ Tasdiqlangan to'lovlar: <b>{paid}</b>\n"
-        f"ð° Jami tushum: <b>{money(revenue)} so'm</b>\n"
-        f"â³ Kutilayotgan to'lovlar: <b>{pending}</b>",
+        "📊 <b>Sizning statistkangiz</b>\n\n"
+        f"👥 Silkangizdan kirganlar: <b>{users}</b>\n"
+        f"💳 Tasdiqlangan to'lovlar: <b>{paid}</b>\n"
+        f"💰 Jami tushum: <b>{money(revenue)} so'm</b>\n"
+        f"⏳ Kutilayotgan to'lovlar: <b>{pending}</b>",
         parse_mode="HTML"
     )
 
@@ -940,7 +973,7 @@ async def my_stats(message: Message):
 # OWNER: ADMINLAR
 # =========================================================
 
-@dp.message(F.text == "ð¥ Adminlar")
+@dp.message(F.text == "👥 Adminlar")
 async def admins_menu(message: Message):
     if message.from_user.id != owner_id():
         return
@@ -949,21 +982,21 @@ async def admins_menu(message: Message):
         "SELECT * FROM admins ORDER BY created_at ASC"
     ).fetchall()
 
-    text = "ð¥ <b>Adminlar</b>\n\n"
+    text = "👥 <b>Adminlar</b>\n\n"
 
     for i, row in enumerate(rows, 1):
-        role = "ð Bosh admin" if row["user_id"] == owner_id() else "ð¡ Admin"
+        role = "👑 Bosh admin" if row["user_id"] == owner_id() else "🛡 Admin"
         text += (
             f"{i}. {role}\n"
-            f"ð¤ {row['name'] or '-'}\n"
-            f"ð @{row['username'] or '-'}\n"
-            f"ð <code>{row['user_id']}</code>\n\n"
+            f"👤 {row['name'] or '-'}\n"
+            f"🔗 @{row['username'] or '-'}\n"
+            f"🆔 <code>{row['user_id']}</code>\n\n"
         )
 
     kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="â Admin tayinlash", callback_data="admin_add")],
-        [InlineKeyboardButton(text="ð Adminni o'chirish", callback_data="admin_del")],
-        [InlineKeyboardButton(text="â¬ï¸ Admin panel", callback_data="admin_panel_cb")]
+        [InlineKeyboardButton(text="➕ Admin tayinlash", callback_data="admin_add")],
+        [InlineKeyboardButton(text="🗑 Adminni o'chirish", callback_data="admin_del")],
+        [InlineKeyboardButton(text="⬅️ Admin panel", callback_data="admin_panel_cb")]
     ])
 
     await message.answer(
@@ -982,7 +1015,7 @@ async def admin_add_start(callback: CallbackQuery, state: FSMContext):
     await state.set_state(AdminAdd.user)
 
     await callback.message.answer(
-        "â <b>Admin tayinlash</b>\n\n"
+        "➕ <b>Admin tayinlash</b>\n\n"
         "Sardor botga avval /start yuborsin.\n\n"
         "Keyin uning @username'ini yoki Telegram ID'sini yuboring.\n\n"
         "Masalan:\n"
@@ -1018,7 +1051,7 @@ async def admin_add_received(message: Message, state: FSMContext):
 
     if not target:
         await message.answer(
-            "â Foydalanuvchi topilmadi.\n\n"
+            "❌ Foydalanuvchi topilmadi.\n\n"
             "U botga /start yuborganini tekshiring.",
             reply_markup=cancel_kb(admin=True)
         )
@@ -1026,7 +1059,7 @@ async def admin_add_received(message: Message, state: FSMContext):
 
     if target == owner_id():
         await message.answer(
-            "â Siz allaqachon bosh adminsiz.",
+            "❌ Siz allaqachon bosh adminsiz.",
             reply_markup=cancel_kb(admin=True)
         )
         return
@@ -1061,10 +1094,10 @@ async def admin_add_received(message: Message, state: FSMContext):
     await state.clear()
 
     await message.answer(
-        "â <b>Admin tayinlandi!</b>\n\n"
-        f"ð ID: <code>{target}</code>\n"
-        f"ð¤ @{username or '-'}\n\n"
-        f"ð Shaxsiy silka:\n<code>{link}</code>\n\n"
+        "✅ <b>Admin tayinlandi!</b>\n\n"
+        f"🆔 ID: <code>{target}</code>\n"
+        f"👤 @{username or '-'}\n\n"
+        f"🔗 Shaxsiy silka:\n<code>{link}</code>\n\n"
         "Endi u o'z panelidan o'z kartasini kiritadi. "
         "Uning kartasi sizning kartangizni o'zgartirmaydi.",
         reply_markup=admin_menu(owner_id()),
@@ -1074,9 +1107,9 @@ async def admin_add_received(message: Message, state: FSMContext):
     try:
         await bot.send_message(
             target,
-            "ð <b>Siz KinoCinema botiga admin tayinlandingiz!</b>\n\n"
-            "ð¨âð» Admin panelga kirib, o'z kartangizni kiriting.\n\n"
-            f"ð Sizning referral silkangiz:\n<code>{link}</code>",
+            "🎉 <b>Siz KinoCinema botiga admin tayinlandingiz!</b>\n\n"
+            "👨‍💻 Admin panelga kirib, o'z kartangizni kiriting.\n\n"
+            f"🔗 Sizning referral silkangiz:\n<code>{link}</code>",
             parse_mode="HTML"
         )
     except Exception as e:
@@ -1092,7 +1125,7 @@ async def admin_del_start(callback: CallbackQuery, state: FSMContext):
     await state.set_state(AdminDelete.user)
 
     await callback.message.answer(
-        "ð <b>Adminni o'chirish</b>\n\n"
+        "🗑 <b>Adminni o'chirish</b>\n\n"
         "O'chiriladigan adminning @username yoki ID'sini yuboring.",
         reply_markup=cancel_kb(admin=True),
         parse_mode="HTML"
@@ -1125,14 +1158,14 @@ async def admin_del_received(message: Message, state: FSMContext):
 
     if not target:
         await message.answer(
-            "â Admin topilmadi.",
+            "❌ Admin topilmadi.",
             reply_markup=cancel_kb(admin=True)
         )
         return
 
     if target == owner_id():
         await message.answer(
-            "â Bosh adminni o'chirib bo'lmaydi.",
+            "❌ Bosh adminni o'chirib bo'lmaydi.",
             reply_markup=cancel_kb(admin=True)
         )
         return
@@ -1146,7 +1179,7 @@ async def admin_del_received(message: Message, state: FSMContext):
     await state.clear()
 
     await message.answer(
-        "ð <b>Admin o'chirildi.</b>\n\n"
+        "🗑 <b>Admin o'chirildi.</b>\n\n"
         f"ID: <code>{target}</code>",
         reply_markup=admin_menu(owner_id()),
         parse_mode="HTML"
@@ -1155,17 +1188,17 @@ async def admin_del_received(message: Message, state: FSMContext):
     try:
         await bot.send_message(
             target,
-            "â ï¸ Sizning KinoCinema admin huquqingiz olib tashlandi."
+            "⚠️ Sizning KinoCinema admin huquqingiz olib tashlandi."
         )
     except Exception:
         pass
 
 
 # =========================================================
-# KANALLAR â FAQAT BOSH ADMIN
+# KANALLAR — FAQAT BOSH ADMIN
 # =========================================================
 
-@dp.message(F.text == "ð¢ Kanal qo'shish")
+@dp.message(F.text == "📢 Kanal qo'shish")
 async def channel_add_start(message: Message, state: FSMContext):
     if message.from_user.id != owner_id():
         return
@@ -1173,13 +1206,13 @@ async def channel_add_start(message: Message, state: FSMContext):
     await state.set_state(ChannelAdd.value)
 
     await message.answer(
-        "ð¢ <b>Kanal qo'shish</b>\n\n"
+        "📢 <b>Kanal qo'shish</b>\n\n"
         "Kanal username'ini yoki ID'sini yuboring.\n\n"
         "Masalan:\n"
         "<code>@uz_kinocinema</code>\n"
         "yoki\n"
         "<code>-1001234567890</code>\n\n"
-        "â ï¸ Bot kanalga administrator bo'lishi kerak.",
+        "⚠️ Bot kanalga administrator bo'lishi kerak.",
         reply_markup=cancel_kb(admin=True),
         parse_mode="HTML"
     )
@@ -1195,7 +1228,7 @@ async def channel_add_received(message: Message, state: FSMContext):
 
     if not value:
         await message.answer(
-            "â Qiymat bo'sh.",
+            "❌ Qiymat bo'sh.",
             reply_markup=cancel_kb(admin=True)
         )
         return
@@ -1212,7 +1245,7 @@ async def channel_add_received(message: Message, state: FSMContext):
     except Exception as e:
         print("KANAL TOPISH:", e)
         await message.answer(
-            "â Kanal topilmadi.\n\n"
+            "❌ Kanal topilmadi.\n\n"
             "Username/ID ni tekshiring.",
             reply_markup=cancel_kb(admin=True)
         )
@@ -1220,7 +1253,7 @@ async def channel_add_received(message: Message, state: FSMContext):
 
     if chat.type != "channel":
         await message.answer(
-            "â Bu Telegram kanali emas.",
+            "❌ Bu Telegram kanali emas.",
             reply_markup=cancel_kb(admin=True)
         )
         return
@@ -1233,7 +1266,7 @@ async def channel_add_received(message: Message, state: FSMContext):
             raise RuntimeError("Bot admin emas")
     except Exception:
         await message.answer(
-            "â Bot bu kanalda administrator emas.\n\n"
+            "❌ Bot bu kanalda administrator emas.\n\n"
             "Avval botni kanalga admin qilib qo'ying.",
             reply_markup=cancel_kb(admin=True)
         )
@@ -1259,7 +1292,7 @@ async def channel_add_received(message: Message, state: FSMContext):
     except sqlite3.IntegrityError:
         await state.clear()
         await message.answer(
-            "â Bu kanal allaqachon qo'shilgan.",
+            "❌ Bu kanal allaqachon qo'shilgan.",
             reply_markup=admin_menu(owner_id())
         )
         return
@@ -1267,16 +1300,16 @@ async def channel_add_received(message: Message, state: FSMContext):
     await state.clear()
 
     await message.answer(
-        "â <b>Kanal qo'shildi!</b>\n\n"
-        f"ð¢ {chat.title}\n"
-        f"ð {saved_username}\n"
-        f"ð <code>{chat.id}</code>",
+        "✅ <b>Kanal qo'shildi!</b>\n\n"
+        f"📢 {chat.title}\n"
+        f"🔗 {saved_username}\n"
+        f"🆔 <code>{chat.id}</code>",
         reply_markup=admin_menu(owner_id()),
         parse_mode="HTML"
     )
 
 
-@dp.message(F.text == "ð Kanal o'chirish")
+@dp.message(F.text == "🗑 Kanal o'chirish")
 async def channel_del_start(message: Message, state: FSMContext):
     if message.from_user.id != owner_id():
         return
@@ -1285,18 +1318,18 @@ async def channel_del_start(message: Message, state: FSMContext):
 
     if not channels:
         await message.answer(
-            "ð¢ Hozircha kanal yo'q.",
+            "📢 Hozircha kanal yo'q.",
             reply_markup=admin_menu(owner_id())
         )
         return
 
-    text = "ð <b>Kanal o'chirish</b>\n\n"
+    text = "🗑 <b>Kanal o'chirish</b>\n\n"
 
     for ch in channels:
         text += (
-            f"ð¢ {ch['title']}\n"
-            f"ð {ch['username']}\n"
-            f"ð <code>{ch['chat_id']}</code>\n\n"
+            f"📢 {ch['title']}\n"
+            f"🔗 {ch['username']}\n"
+            f"🆔 <code>{ch['chat_id']}</code>\n\n"
         )
 
     await state.set_state(ChannelDelete.value)
@@ -1329,7 +1362,7 @@ async def channel_del_received(message: Message, state: FSMContext):
 
     if not row:
         await message.answer(
-            "â Kanal topilmadi.",
+            "❌ Kanal topilmadi.",
             reply_markup=cancel_kb(admin=True)
         )
         return
@@ -1343,14 +1376,14 @@ async def channel_del_received(message: Message, state: FSMContext):
     await state.clear()
 
     await message.answer(
-        "ð <b>Kanal o'chirildi.</b>\n\n"
-        f"ð¢ {row['title']}",
+        "🗑 <b>Kanal o'chirildi.</b>\n\n"
+        f"📢 {row['title']}",
         reply_markup=admin_menu(owner_id()),
         parse_mode="HTML"
     )
 
 
-@dp.message(F.text == "ð Kanallar")
+@dp.message(F.text == "📋 Kanallar")
 async def channels_list(message: Message):
     if message.from_user.id != owner_id():
         return
@@ -1358,16 +1391,16 @@ async def channels_list(message: Message):
     channels = get_channels()
 
     if not channels:
-        await message.answer("ð¢ Majburiy kanal yo'q.")
+        await message.answer("📢 Majburiy kanal yo'q.")
         return
 
-    text = "ð¢ <b>Majburiy kanallar</b>\n\n"
+    text = "📢 <b>Majburiy kanallar</b>\n\n"
 
     for i, ch in enumerate(channels, 1):
         text += (
             f"{i}. <b>{ch['title']}</b>\n"
-            f"ð {ch['username']}\n"
-            f"ð <code>{ch['chat_id']}</code>\n\n"
+            f"🔗 {ch['username']}\n"
+            f"🆔 <code>{ch['chat_id']}</code>\n\n"
         )
 
     await message.answer(
@@ -1377,10 +1410,10 @@ async def channels_list(message: Message):
 
 
 # =========================================================
-# UMUMIY STATISTIKA â FAQAT BOSH ADMIN
+# UMUMIY STATISTIKA — FAQAT BOSH ADMIN
 # =========================================================
 
-@dp.message(F.text == "ð Umumiy statistika")
+@dp.message(F.text == "📊 Umumiy statistika")
 async def global_stats(message: Message):
     if message.from_user.id != owner_id():
         return
@@ -1414,13 +1447,13 @@ async def global_stats(message: Message):
     """).fetchone()["s"]
 
     await message.answer(
-        "ð <b>Umumiy statistika</b>\n\n"
-        f"ð¥ Foydalanuvchilar: <b>{users}</b>\n"
-        f"ð¡ Adminlar: <b>{admins}</b>\n"
-        f"ð¬ Kinolar: <b>{movies}</b>\n"
-        f"ð Ko'rishlar: <b>{views}</b>\n"
-        f"ð³ Tasdiqlangan to'lovlar: <b>{paid}</b>\n"
-        f"ð° Jami tushum: <b>{money(revenue)} so'm</b>",
+        "📊 <b>Umumiy statistika</b>\n\n"
+        f"👥 Foydalanuvchilar: <b>{users}</b>\n"
+        f"🛡 Adminlar: <b>{admins}</b>\n"
+        f"🎬 Kinolar: <b>{movies}</b>\n"
+        f"👁 Ko'rishlar: <b>{views}</b>\n"
+        f"💳 Tasdiqlangan to'lovlar: <b>{paid}</b>\n"
+        f"💰 Jami tushum: <b>{money(revenue)} so'm</b>",
         parse_mode="HTML"
     )
 
@@ -1429,7 +1462,7 @@ async def global_stats(message: Message):
 # PRIME STATUS
 # =========================================================
 
-@dp.message(F.text == "â­ Prime status")
+@dp.message(F.text == "⭐ Prime status")
 async def prime_status(message: Message):
     if not await require_subscription(message):
         return
@@ -1443,22 +1476,22 @@ async def prime_status(message: Message):
         until = datetime.fromisoformat(row["prime_until"])
 
         await message.answer(
-            "â­ <b>Prime/VIP faol!</b>\n\n"
-            f"â³ Tugash vaqti:\n"
+            "⭐ <b>Prime/VIP faol!</b>\n\n"
+            f"⏳ Tugash vaqti:\n"
             f"<b>{until.strftime('%d.%m.%Y %H:%M')}</b>",
             parse_mode="HTML"
         )
         return
 
     await message.answer(
-        "â­ <b>Prime/VIP</b>\n\n"
+        "⭐ <b>Prime/VIP</b>\n\n"
         "Tarifni tanlang:",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="7 kun â 7 000 so'm", callback_data="plan_7")],
-            [InlineKeyboardButton(text="1 oy â 20 000 so'm", callback_data="plan_30")],
-            [InlineKeyboardButton(text="3 oy â 50 000 so'm", callback_data="plan_90")],
-            [InlineKeyboardButton(text="Umrbod â 150 000 so'm", callback_data="plan_36500")],
-            [InlineKeyboardButton(text="â Yopish", callback_data="close_prime")]
+            [InlineKeyboardButton(text="7 kun — 7 000 so'm", callback_data="plan_7")],
+            [InlineKeyboardButton(text="1 oy — 20 000 so'm", callback_data="plan_30")],
+            [InlineKeyboardButton(text="3 oy — 50 000 so'm", callback_data="plan_90")],
+            [InlineKeyboardButton(text="Umrbod — 150 000 so'm", callback_data="plan_36500")],
+            [InlineKeyboardButton(text="❌ Yopish", callback_data="close_prime")]
         ]),
         parse_mode="HTML"
     )
@@ -1504,7 +1537,7 @@ async def choose_plan(callback: CallbackQuery):
 
     if not card:
         await callback.message.answer(
-            "â <b>To'lov kartasi sozlanmagan.</b>\n\n"
+            "❌ <b>To'lov kartasi sozlanmagan.</b>\n\n"
             "Siz kirgan referral admin hali o'z kartasini "
             "botga kiritmagan.",
             parse_mode="HTML"
@@ -1534,19 +1567,19 @@ async def choose_plan(callback: CallbackQuery):
     db.commit()
 
     await callback.message.answer(
-        f"â­ <b>Prime â {name}</b>\n\n"
-        f"ð° Narxi: <b>{money(price)} so'm</b>\n\n"
-        f"ð³ Karta:\n<code>{card}</code>\n"
-        f"ð¤ Karta egasi: <b>{card_owner}</b>\n\n"
+        f"⭐ <b>Prime — {name}</b>\n\n"
+        f"💰 Narxi: <b>{money(price)} so'm</b>\n\n"
+        f"💳 Karta:\n<code>{card}</code>\n"
+        f"👤 Karta egasi: <b>{card_owner}</b>\n\n"
         "To'lovni amalga oshirgach, "
-        "Â«ð³ To'ladimÂ» tugmasini bosing.",
+        "«💳 To'ladim» tugmasini bosing.",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(
-                text="ð³ To'ladim",
+                text="💳 To'ladim",
                 callback_data=f"paid_{order_id}"
             )],
             [InlineKeyboardButton(
-                text="â¬ï¸ Orqaga",
+                text="⬅️ Orqaga",
                 callback_data="prime_back"
             )]
         ]),
@@ -1559,13 +1592,13 @@ async def choose_plan(callback: CallbackQuery):
 @dp.callback_query(F.data == "prime_back")
 async def prime_back(callback: CallbackQuery):
     await callback.message.answer(
-        "â­ <b>Prime tariflari:</b>",
+        "⭐ <b>Prime tariflari:</b>",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="7 kun â 7 000 so'm", callback_data="plan_7")],
-            [InlineKeyboardButton(text="1 oy â 20 000 so'm", callback_data="plan_30")],
-            [InlineKeyboardButton(text="3 oy â 50 000 so'm", callback_data="plan_90")],
-            [InlineKeyboardButton(text="Umrbod â 150 000 so'm", callback_data="plan_36500")],
-            [InlineKeyboardButton(text="â Yopish", callback_data="close_prime")]
+            [InlineKeyboardButton(text="7 kun — 7 000 so'm", callback_data="plan_7")],
+            [InlineKeyboardButton(text="1 oy — 20 000 so'm", callback_data="plan_30")],
+            [InlineKeyboardButton(text="3 oy — 50 000 so'm", callback_data="plan_90")],
+            [InlineKeyboardButton(text="Umrbod — 150 000 so'm", callback_data="plan_36500")],
+            [InlineKeyboardButton(text="❌ Yopish", callback_data="close_prime")]
         ]),
         parse_mode="HTML"
     )
@@ -1599,7 +1632,7 @@ async def paid_start(callback: CallbackQuery, state: FSMContext):
     await state.set_state(Payment.screenshot)
 
     await callback.message.answer(
-        "ð¸ <b>To'lov screenshotini yuboring.</b>\n\n"
+        "📸 <b>To'lov screenshotini yuboring.</b>\n\n"
         "Rasm ko'rinishida yuboring.",
         reply_markup=cancel_kb(admin=False),
         parse_mode="HTML"
@@ -1619,13 +1652,13 @@ async def payment_photo(message: Message, state: FSMContext):
 
     if not order:
         await state.clear()
-        await message.answer("â Buyurtma topilmadi.")
+        await message.answer("❌ Buyurtma topilmadi.")
         return
 
     if order["status"] != "pending":
         await state.clear()
         await message.answer(
-            "â Bu buyurtma allaqachon ko'rib chiqilgan."
+            "❌ Bu buyurtma allaqachon ko'rib chiqilgan."
         )
         return
 
@@ -1634,7 +1667,7 @@ async def payment_photo(message: Message, state: FSMContext):
     if not target_admin:
         await state.clear()
         await message.answer(
-            "â Admin topilmadi."
+            "❌ Admin topilmadi."
         )
         return
 
@@ -1647,14 +1680,14 @@ async def payment_photo(message: Message, state: FSMContext):
     admin = admin_row(target_admin)
 
     caption = (
-        "ð§¾ <b>Yangi PRIME to'lov!</b>\n\n"
-        f"ð¤ User: {username}\n"
-        f"ð ID: <code>{order['user_id']}</code>\n"
-        f"ð¡ Admin: @{admin['username'] if admin else '-'}\n"
-        f"ð¦ Tarif: <b>{order['plan']}</b>\n"
-        f"â³ Muddat: <b>{order['days']} kun</b>\n"
-        f"ð° Narx: <b>{money(order['price'])} so'm</b>\n\n"
-        "ð¸ To'lov skrinshoti:"
+        "🧾 <b>Yangi PRIME to'lov!</b>\n\n"
+        f"👤 User: {username}\n"
+        f"🆔 ID: <code>{order['user_id']}</code>\n"
+        f"🛡 Admin: @{admin['username'] if admin else '-'}\n"
+        f"📦 Tarif: <b>{order['plan']}</b>\n"
+        f"⏳ Muddat: <b>{order['days']} kun</b>\n"
+        f"💰 Narx: <b>{money(order['price'])} so'm</b>\n\n"
+        "📸 To'lov skrinshoti:"
     )
 
     try:
@@ -1665,11 +1698,11 @@ async def payment_photo(message: Message, state: FSMContext):
             reply_markup=InlineKeyboardMarkup(inline_keyboard=[
                 [
                     InlineKeyboardButton(
-                        text="â Tasdiqlash",
+                        text="✅ Tasdiqlash",
                         callback_data=f"approve_{order_id}"
                     ),
                     InlineKeyboardButton(
-                        text="â Bekor qilish",
+                        text="❌ Bekor qilish",
                         callback_data=f"reject_{order_id}"
                     )
                 ]
@@ -1680,7 +1713,7 @@ async def payment_photo(message: Message, state: FSMContext):
         print("PAYMENT SEND:", e)
         await state.clear()
         await message.answer(
-            "â Screenshot adminga yuborilmadi.\n\n"
+            "❌ Screenshot adminga yuborilmadi.\n\n"
             "Admin botga /start yuborganini tekshiring."
         )
         return
@@ -1688,7 +1721,7 @@ async def payment_photo(message: Message, state: FSMContext):
     await state.clear()
 
     await message.answer(
-        "â³ <b>To'lovingiz tekshirilmoqda.</b>\n\n"
+        "⏳ <b>To'lovingiz tekshirilmoqda.</b>\n\n"
         "Tasdiqlangach Prime/VIP avtomatik ochiladi.",
         reply_markup=main_menu(message.from_user.id),
         parse_mode="HTML"
@@ -1698,7 +1731,7 @@ async def payment_photo(message: Message, state: FSMContext):
 @dp.message(StateFilter(Payment.screenshot))
 async def payment_wrong(message: Message):
     await message.answer(
-        "ð¸ Screenshotni rasm sifatida yuboring.",
+        "📸 Screenshotni rasm sifatida yuboring.",
         reply_markup=cancel_kb()
     )
 
@@ -1757,11 +1790,11 @@ async def approve_payment(callback: CallbackQuery):
     try:
         await bot.send_message(
             order["user_id"],
-            "ð <b>To'lov tasdiqlandi!</b>\n\n"
-            f"â­ Prime/VIP: <b>{order['plan']}</b>\n"
-            f"â³ Muddat: <b>{order['days']} kun</b>\n"
-            f"ð Tugash: <b>{until.strftime('%d.%m.%Y %H:%M')}</b>\n\n"
-            "â Prime/VIP ochildi!",
+            "🎉 <b>To'lov tasdiqlandi!</b>\n\n"
+            f"⭐ Prime/VIP: <b>{order['plan']}</b>\n"
+            f"⏳ Muddat: <b>{order['days']} kun</b>\n"
+            f"📅 Tugash: <b>{until.strftime('%d.%m.%Y %H:%M')}</b>\n\n"
+            "✅ Prime/VIP ochildi!",
             parse_mode="HTML"
         )
     except Exception as e:
@@ -1771,14 +1804,14 @@ async def approve_payment(callback: CallbackQuery):
         await callback.message.edit_caption(
             caption=(
                 (callback.message.caption or "")
-                + "\n\nâ <b>TASDIQLANDI</b>"
+                + "\n\n✅ <b>TASDIQLANDI</b>"
             ),
             parse_mode="HTML"
         )
     except Exception:
         pass
 
-    await callback.answer("â Prime/VIP ochildi!")
+    await callback.answer("✅ Prime/VIP ochildi!")
 
 
 @dp.callback_query(F.data.startswith("reject_"))
@@ -1830,7 +1863,7 @@ async def reject_payment(callback: CallbackQuery):
     try:
         await bot.send_message(
             order["user_id"],
-            "â <b>To'lov tasdiqlanmadi.</b>\n\n"
+            "❌ <b>To'lov tasdiqlanmadi.</b>\n\n"
             "Prime/VIP ochilmadi.",
             parse_mode="HTML"
         )
@@ -1841,21 +1874,21 @@ async def reject_payment(callback: CallbackQuery):
         await callback.message.edit_caption(
             caption=(
                 (callback.message.caption or "")
-                + "\n\nâ <b>BEKOR QILINDI</b>"
+                + "\n\n❌ <b>BEKOR QILINDI</b>"
             ),
             parse_mode="HTML"
         )
     except Exception:
         pass
 
-    await callback.answer("â To'lov bekor qilindi.")
+    await callback.answer("❌ To'lov bekor qilindi.")
 
 
 # =========================================================
 # KINO QIDIRISH
 # =========================================================
 
-@dp.message(F.text == "ð Kino qidirish")
+@dp.message(F.text == "🔎 Kino qidirish")
 async def search_start(message: Message, state: FSMContext):
     if not await require_subscription(message):
         return
@@ -1863,7 +1896,7 @@ async def search_start(message: Message, state: FSMContext):
     await state.set_state(SearchMovie.query)
 
     await message.answer(
-        "ð <b>Kino qidirish</b>\n\n"
+        "🔎 <b>Kino qidirish</b>\n\n"
         "Kino kodini yoki nomini yuboring.\n\n"
         "Masalan: <code>247</code>",
         reply_markup=cancel_kb(),
@@ -1889,7 +1922,7 @@ async def search_received(message: Message, state: FSMContext):
 
     if not rows:
         await message.answer(
-            "â <b>Kino topilmadi.</b>",
+            "❌ <b>Kino topilmadi.</b>",
             reply_markup=main_menu(message.from_user.id),
             parse_mode="HTML"
         )
@@ -1898,11 +1931,11 @@ async def search_received(message: Message, state: FSMContext):
     for movie in rows:
         if movie["prime"] and not is_prime(message.from_user.id):
             await message.answer(
-                f"ð <b>{movie['title']}</b>\n\n"
+                f"🔒 <b>{movie['title']}</b>\n\n"
                 "Bu kino faqat Prime/VIP uchun.",
                 reply_markup=InlineKeyboardMarkup(inline_keyboard=[
                     [InlineKeyboardButton(
-                        text="â­ Prime olish",
+                        text="⭐ Prime olish",
                         callback_data="prime_back"
                     )]
                 ]),
@@ -1920,15 +1953,15 @@ async def search_received(message: Message, state: FSMContext):
             message.chat.id,
             movie["file_id"],
             caption=(
-                f"ð¬ <b>{movie['title']}</b>\n\n"
-                f"ð¢ Kod: <code>{movie['code']}</code>\n\n"
-                "ð¿ Yoqimli tomosha!"
+                f"🎬 <b>{movie['title']}</b>\n\n"
+                f"🔢 Kod: <code>{movie['code']}</code>\n\n"
+                "🍿 Yoqimli tomosha!"
             ),
             parse_mode="HTML"
         )
 
     await message.answer(
-        "ð  Asosiy menyu:",
+        "🏠 Asosiy menyu:",
         reply_markup=main_menu(message.from_user.id)
     )
 
@@ -1937,7 +1970,7 @@ async def search_received(message: Message, state: FSMContext):
 # KINOLAR RO'YXATI
 # =========================================================
 
-@dp.message(F.text == "ð Kinolar ro'yxati")
+@dp.message(F.text == "📚 Kinolar ro'yxati")
 async def movie_list(message: Message):
     if not await require_subscription(message):
         return
@@ -1947,13 +1980,13 @@ async def movie_list(message: Message):
     ).fetchall()
 
     if not rows:
-        await message.answer("ð Hozircha kinolar yo'q.")
+        await message.answer("📚 Hozircha kinolar yo'q.")
         return
 
     buttons = []
 
     for movie in rows:
-        title = ("â­ " if movie["prime"] else "") + movie["title"]
+        title = ("⭐ " if movie["prime"] else "") + movie["title"]
 
         buttons.append([
             InlineKeyboardButton(
@@ -1964,13 +1997,13 @@ async def movie_list(message: Message):
 
     buttons.append([
         InlineKeyboardButton(
-            text="â Yopish",
+            text="❌ Yopish",
             callback_data="close_movies"
         )
     ])
 
     await message.answer(
-        "ð <b>Kinolar ro'yxati</b>\n\n"
+        "📚 <b>Kinolar ro'yxati</b>\n\n"
         "Kerakli kinoni tanlang:",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons),
         parse_mode="HTML"
@@ -2012,10 +2045,10 @@ async def movie_click(callback: CallbackQuery):
 
     if movie["prime"] and not is_prime(callback.from_user.id):
         await callback.message.answer(
-            "ð Bu kino faqat Prime/VIP uchun.",
+            "🔒 Bu kino faqat Prime/VIP uchun.",
             reply_markup=InlineKeyboardMarkup(inline_keyboard=[
                 [InlineKeyboardButton(
-                    text="â­ Prime olish",
+                    text="⭐ Prime olish",
                     callback_data="prime_back"
                 )]
             ])
@@ -2033,9 +2066,9 @@ async def movie_click(callback: CallbackQuery):
         callback.from_user.id,
         movie["file_id"],
         caption=(
-            f"ð¬ <b>{movie['title']}</b>\n\n"
-            f"ð¢ Kod: <code>{movie['code']}</code>\n\n"
-            "ð¿ Yoqimli tomosha!"
+            f"🎬 <b>{movie['title']}</b>\n\n"
+            f"🔢 Kod: <code>{movie['code']}</code>\n\n"
+            "🍿 Yoqimli tomosha!"
         ),
         parse_mode="HTML"
     )
@@ -2047,7 +2080,7 @@ async def movie_click(callback: CallbackQuery):
 # KINO QO'SHISH
 # =========================================================
 
-@dp.message(F.text == "â Kino qo'shish")
+@dp.message(F.text == "➕ Kino qo'shish")
 async def add_movie_start(message: Message, state: FSMContext):
     if not is_admin_id(message.from_user.id):
         return
@@ -2055,7 +2088,7 @@ async def add_movie_start(message: Message, state: FSMContext):
     await state.set_state(AddMovie.code)
 
     await message.answer(
-        "â <b>Kino qo'shish â 1/4</b>\n\n"
+        "➕ <b>Kino qo'shish — 1/4</b>\n\n"
         "Kino kodini yuboring.\n\n"
         "Masalan: <code>247</code>",
         reply_markup=cancel_kb(admin=True),
@@ -2073,7 +2106,7 @@ async def add_movie_code(message: Message, state: FSMContext):
 
     if not code:
         await message.answer(
-            "â Kod bo'sh bo'lishi mumkin emas.",
+            "❌ Kod bo'sh bo'lishi mumkin emas.",
             reply_markup=cancel_kb(admin=True)
         )
         return
@@ -2085,7 +2118,7 @@ async def add_movie_code(message: Message, state: FSMContext):
 
     if exists:
         await message.answer(
-            "â Bu kod allaqachon mavjud.",
+            "❌ Bu kod allaqachon mavjud.",
             reply_markup=cancel_kb(admin=True)
         )
         return
@@ -2094,7 +2127,7 @@ async def add_movie_code(message: Message, state: FSMContext):
     await state.set_state(AddMovie.title)
 
     await message.answer(
-        "â <b>Kino qo'shish â 2/4</b>\n\n"
+        "➕ <b>Kino qo'shish — 2/4</b>\n\n"
         "Kino nomini yuboring.",
         reply_markup=cancel_kb(admin=True),
         parse_mode="HTML"
@@ -2111,7 +2144,7 @@ async def add_movie_title(message: Message, state: FSMContext):
 
     if not title:
         await message.answer(
-            "â Kino nomi bo'sh.",
+            "❌ Kino nomi bo'sh.",
             reply_markup=cancel_kb(admin=True)
         )
         return
@@ -2120,7 +2153,7 @@ async def add_movie_title(message: Message, state: FSMContext):
     await state.set_state(AddMovie.video)
 
     await message.answer(
-        "â <b>Kino qo'shish â 3/4</b>\n\n"
+        "➕ <b>Kino qo'shish — 3/4</b>\n\n"
         "Kino videosini yuboring.",
         reply_markup=cancel_kb(admin=True),
         parse_mode="HTML"
@@ -2139,19 +2172,19 @@ async def add_movie_video(message: Message, state: FSMContext):
     await state.set_state(AddMovie.prime)
 
     await message.answer(
-        "â <b>Kino qo'shish â 4/4</b>\n\n"
+        "➕ <b>Kino qo'shish — 4/4</b>\n\n"
         "Kino turini tanlang:",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(
-                text="ð Oddiy kino",
+                text="🆓 Oddiy kino",
                 callback_data="movie_normal"
             )],
             [InlineKeyboardButton(
-                text="â­ Prime/VIP kino",
+                text="⭐ Prime/VIP kino",
                 callback_data="movie_prime"
             )],
             [InlineKeyboardButton(
-                text="â Bekor qilish",
+                text="❌ Bekor qilish",
                 callback_data="movie_add_cancel"
             )]
         ]),
@@ -2162,7 +2195,7 @@ async def add_movie_video(message: Message, state: FSMContext):
 @dp.message(StateFilter(AddMovie.video))
 async def add_movie_wrong(message: Message):
     await message.answer(
-        "â Videoni video sifatida yuboring.",
+        "❌ Videoni video sifatida yuboring.",
         reply_markup=cancel_kb(admin=True)
     )
 
@@ -2172,7 +2205,7 @@ async def movie_add_cancel(callback: CallbackQuery, state: FSMContext):
     await state.clear()
 
     await callback.message.answer(
-        "â Kino qo'shish bekor qilindi.",
+        "❌ Kino qo'shish bekor qilindi.",
         reply_markup=admin_menu(callback.from_user.id)
     )
     await callback.answer()
@@ -2212,7 +2245,7 @@ async def movie_add_finish(callback: CallbackQuery, state: FSMContext):
         await state.clear()
 
         await callback.message.answer(
-            "â Bu kod allaqachon mavjud.",
+            "❌ Bu kod allaqachon mavjud.",
             reply_markup=admin_menu(callback.from_user.id)
         )
         await callback.answer()
@@ -2221,10 +2254,10 @@ async def movie_add_finish(callback: CallbackQuery, state: FSMContext):
     await state.clear()
 
     await callback.message.answer(
-        "â <b>Kino qo'shildi!</b>\n\n"
-        f"ð¬ {data['title']}\n"
-        f"ð¢ Kod: <code>{data['code']}</code>\n"
-        f"â­ Prime/VIP: {'Ha' if prime else 'Yoâq'}\n\n"
+        "✅ <b>Kino qo'shildi!</b>\n\n"
+        f"🎬 {data['title']}\n"
+        f"🔢 Kod: <code>{data['code']}</code>\n"
+        f"⭐ Prime/VIP: {'Ha' if prime else 'Yo‘q'}\n\n"
         "Endi foydalanuvchi kodni yozsa, kino chiqadi.",
         reply_markup=admin_menu(callback.from_user.id),
         parse_mode="HTML"
@@ -2236,7 +2269,7 @@ async def movie_add_finish(callback: CallbackQuery, state: FSMContext):
 # KINO O'CHIRISH
 # =========================================================
 
-@dp.message(F.text == "ð Kino o'chirish")
+@dp.message(F.text == "🗑 Kino o'chirish")
 async def delete_movie_start(message: Message, state: FSMContext):
     if not is_admin_id(message.from_user.id):
         return
@@ -2244,7 +2277,7 @@ async def delete_movie_start(message: Message, state: FSMContext):
     await state.set_state(DeleteMovie.code)
 
     await message.answer(
-        "ð <b>Kino o'chirish</b>\n\n"
+        "🗑 <b>Kino o'chirish</b>\n\n"
         "Kino kodini yuboring.",
         reply_markup=cancel_kb(admin=True),
         parse_mode="HTML"
@@ -2266,7 +2299,7 @@ async def delete_movie_received(message: Message, state: FSMContext):
 
     if not movie:
         await message.answer(
-            "â Kino topilmadi.",
+            "❌ Kino topilmadi.",
             reply_markup=cancel_kb(admin=True)
         )
         return
@@ -2280,9 +2313,9 @@ async def delete_movie_received(message: Message, state: FSMContext):
     await state.clear()
 
     await message.answer(
-        "ð <b>Kino o'chirildi.</b>\n\n"
-        f"ð¬ {movie['title']}\n"
-        f"ð¢ Kod: <code>{code}</code>",
+        "🗑 <b>Kino o'chirildi.</b>\n\n"
+        f"🎬 {movie['title']}\n"
+        f"🔢 Kod: <code>{code}</code>",
         reply_markup=admin_menu(message.from_user.id),
         parse_mode="HTML"
     )
@@ -2292,7 +2325,7 @@ async def delete_movie_received(message: Message, state: FSMContext):
 # KINO BUYURTMA
 # =========================================================
 
-@dp.message(F.text == "ð¬ Kino buyurtma qilish")
+@dp.message(F.text == "🎬 Kino buyurtma qilish")
 async def request_start(message: Message, state: FSMContext):
     if not await require_subscription(message):
         return
@@ -2300,7 +2333,7 @@ async def request_start(message: Message, state: FSMContext):
     await state.set_state(MovieRequest.text)
 
     await message.answer(
-        "ð¬ <b>Kino buyurtma qilish</b>\n\n"
+        "🎬 <b>Kino buyurtma qilish</b>\n\n"
         "Qaysi kinoni izlayotganingizni yozing:",
         reply_markup=cancel_kb(),
         parse_mode="HTML"
@@ -2331,17 +2364,17 @@ async def request_received(message: Message, state: FSMContext):
     try:
         await bot.send_message(
             ref_id,
-            "ð¬ <b>Yangi kino buyurtmasi!</b>\n\n"
-            f"ð¤ @{message.from_user.username or '-'}\n"
-            f"ð <code>{message.from_user.id}</code>\n\n"
-            f"ð {text}",
+            "🎬 <b>Yangi kino buyurtmasi!</b>\n\n"
+            f"👤 @{message.from_user.username or '-'}\n"
+            f"🆔 <code>{message.from_user.id}</code>\n\n"
+            f"📝 {text}",
             parse_mode="HTML"
         )
     except Exception as e:
         print("REQUEST SEND:", e)
 
     await message.answer(
-        "â <b>Buyurtmangiz adminga yuborildi.</b>",
+        "✅ <b>Buyurtmangiz adminga yuborildi.</b>",
         reply_markup=main_menu(message.from_user.id),
         parse_mode="HTML"
     )
@@ -2351,35 +2384,35 @@ async def request_received(message: Message, state: FSMContext):
 # INSTAGRAM / REKLAMA
 # =========================================================
 
-@dp.message(F.text == "ð¸ Instagramga qaytish")
+@dp.message(F.text == "📸 Instagramga qaytish")
 async def instagram(message: Message):
     await message.answer(
-        "ð¸ Instagram:",
+        "📸 Instagram:",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(
-                text="ð¸ Instagram",
+                text="📸 Instagram",
                 url="https://www.instagram.com/oemovie/"
             )],
             [InlineKeyboardButton(
-                text="â Yopish",
+                text="❌ Yopish",
                 callback_data="close_msg"
             )]
         ])
     )
 
 
-@dp.message(F.text == "ð¤ Reklama & Bot olish")
+@dp.message(F.text == "🤝 Reklama & Bot olish")
 async def advertising(message: Message):
     await message.answer(
-        "ð¤ <b>Reklama & Bot olish</b>\n\n"
+        "🤝 <b>Reklama & Bot olish</b>\n\n"
         "Admin bilan bog'lanish:",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(
-                text="ð¨âð» Admin",
+                text="👨‍💻 Admin",
                 url=f"https://t.me/{OWNER_USERNAME}"
             )],
             [InlineKeyboardButton(
-                text="â Yopish",
+                text="❌ Yopish",
                 callback_data="close_msg"
             )]
         ]),
@@ -2394,6 +2427,30 @@ async def close_msg(callback: CallbackQuery):
     except Exception:
         pass
     await callback.answer()
+
+
+# =========================================================
+# CALLBACK SUBSCRIPTION GUARD
+# =========================================================
+
+# Any inline button that belongs to the user side must be blocked
+# if the user has left a mandatory channel.
+@dp.callback_query()
+async def subscription_callback_guard(callback: CallbackQuery):
+    if is_admin_id(callback.from_user.id):
+        return
+
+    # Allow only the subscription confirmation callback while unsubscribed.
+    if callback.data == "check_sub":
+        return
+
+    if await check_subscription(callback.from_user.id):
+        return
+
+    await callback.answer(
+        "🔐 Avval majburiy kanalga obuna bo'ling.",
+        show_alert=True
+    )
 
 
 # =========================================================
@@ -2412,7 +2469,7 @@ async def admin_panel_cb(callback: CallbackQuery, state: FSMContext):
         return
 
     await callback.message.answer(
-        "ð¨âð» <b>Admin panel</b>",
+        "👨‍💻 <b>Admin panel</b>",
         reply_markup=admin_menu(callback.from_user.id),
         parse_mode="HTML"
     )
@@ -2431,27 +2488,27 @@ async def fallback_search(message: Message):
         return
 
     known_buttons = {
-        "ð Kino qidirish",
-        "â­ Prime status",
-        "ð Kinolar ro'yxati",
-        "ð¸ Instagramga qaytish",
-        "ð¬ Kino buyurtma qilish",
-        "ð¤ Reklama & Bot olish",
-        "ð¨âð» Admin panel",
-        "â Kino qo'shish",
-        "ð Kino o'chirish",
-        "ð³ Mening kartam",
-        "ð Mening statistikam",
-        "ð Mening silkam",
-        "ð¥ Adminlar",
-        "ð¢ Kanal qo'shish",
-        "ð Kanal o'chirish",
-        "ð Kanallar",
-        "ð Umumiy statistika",
-        "ð  Asosiy menyu",
-        "â¬ï¸ Admin panel",
-        "â¬ï¸ Asosiy menyu",
-        "â Bekor qilish",
+        "🔎 Kino qidirish",
+        "⭐ Prime status",
+        "📚 Kinolar ro'yxati",
+        "📸 Instagramga qaytish",
+        "🎬 Kino buyurtma qilish",
+        "🤝 Reklama & Bot olish",
+        "👨‍💻 Admin panel",
+        "➕ Kino qo'shish",
+        "🗑 Kino o'chirish",
+        "💳 Mening kartam",
+        "📊 Mening statistikam",
+        "🔗 Mening silkam",
+        "👥 Adminlar",
+        "📢 Kanal qo'shish",
+        "🗑 Kanal o'chirish",
+        "📋 Kanallar",
+        "📊 Umumiy statistika",
+        "🏠 Asosiy menyu",
+        "⬅️ Admin panel",
+        "⬅️ Asosiy menyu",
+        "❌ Bekor qilish",
     }
 
     if text in known_buttons:
@@ -2473,8 +2530,8 @@ async def fallback_search(message: Message):
 
     if not rows:
         await message.answer(
-            "â Buyruq yoki kino topilmadi.\n\n"
-            "ð Kino qidirish tugmasini bosing yoki "
+            "❌ Buyruq yoki kino topilmadi.\n\n"
+            "🔎 Kino qidirish tugmasini bosing yoki "
             "kino kodini yozing."
         )
         return
@@ -2482,11 +2539,11 @@ async def fallback_search(message: Message):
     for movie in rows:
         if movie["prime"] and not is_prime(message.from_user.id):
             await message.answer(
-                f"ð <b>{movie['title']}</b>\n\n"
+                f"🔒 <b>{movie['title']}</b>\n\n"
                 "Bu kino faqat Prime/VIP uchun.",
                 reply_markup=InlineKeyboardMarkup(inline_keyboard=[
                     [InlineKeyboardButton(
-                        text="â­ Prime olish",
+                        text="⭐ Prime olish",
                         callback_data="prime_back"
                     )]
                 ]),
@@ -2504,9 +2561,9 @@ async def fallback_search(message: Message):
             message.chat.id,
             movie["file_id"],
             caption=(
-                f"ð¬ <b>{movie['title']}</b>\n\n"
-                f"ð¢ Kod: <code>{movie['code']}</code>\n\n"
-                "ð¿ Yoqimli tomosha!"
+                f"🎬 <b>{movie['title']}</b>\n\n"
+                f"🔢 Kod: <code>{movie['code']}</code>\n\n"
+                "🍿 Yoqimli tomosha!"
             ),
             parse_mode="HTML"
         )
@@ -2521,7 +2578,7 @@ async def myid(message: Message):
     ensure_owner(message.from_user)
 
     await message.answer(
-        f"ð Sizning Telegram ID: <code>{message.from_user.id}</code>",
+        f"🆔 Sizning Telegram ID: <code>{message.from_user.id}</code>",
         parse_mode="HTML"
     )
 
@@ -2560,7 +2617,7 @@ async def start_web_server():
 # =========================================================
 
 async def main():
-    print("ð¬ KinoCinema bot ishga tushmoqda...")
+    print("🎬 KinoCinema bot ishga tushmoqda...")
 
     await start_web_server()
 
