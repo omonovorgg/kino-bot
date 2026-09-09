@@ -34,12 +34,16 @@ db.commit()
 
 
 # =========================
-# SUBSCRIPTION CHECK
+# SUBSCRIPTION
 # =========================
 
 async def check_subscription(user_id):
+
     try:
-        member = await bot.get_chat_member(CHANNEL, user_id)
+        member = await bot.get_chat_member(
+            CHANNEL,
+            user_id
+        )
 
         return member.status in [
             "member",
@@ -50,10 +54,6 @@ async def check_subscription(user_id):
     except Exception:
         return False
 
-
-# =========================
-# SUBSCRIPTION BUTTONS
-# =========================
 
 def subscription_keyboard():
 
@@ -106,7 +106,7 @@ async def start(message: types.Message):
 
 
 # =========================
-# CHECK SUBSCRIPTION BUTTON
+# CHECK SUBSCRIPTION
 # =========================
 
 @dp.callback_query(lambda c: c.data == "check_sub")
@@ -132,6 +132,20 @@ async def check_sub(callback: types.CallbackQuery):
             "❌ Avval kanalga obuna bo‘ling!",
             show_alert=True
         )
+
+
+# =========================
+# GET TELEGRAM ID
+# =========================
+
+@dp.message(Command("myid"))
+async def my_id(message: types.Message):
+
+    await message.answer(
+        f"🆔 Sizning Telegram ID:\n"
+        f"`{message.from_user.id}`",
+        parse_mode="Markdown"
+    )
 
 
 # =========================
@@ -170,7 +184,8 @@ async def get_movie(message: types.Message):
 
         await message.answer_video(
             movie[0],
-            caption="🎬 KinoCinema"
+            caption="🎬 KinoCinema\n\n"
+                    "🍿 Yoqimli tomosha!"
         )
 
     else:
@@ -227,7 +242,7 @@ async def start_web_server():
 
 async def main():
 
-    print("Bot ishga tushmoqda...")
+    print("🎬 KinoCinema bot ishga tushmoqda...")
 
     runner = await start_web_server()
 
