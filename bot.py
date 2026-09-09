@@ -1,162 +1,73 @@
 import os
-import re
 import asyncio
+import logging
 import sqlite3
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta
+from html import escape
 
 from aiohttp import web
-from aiogram import Bot, Dispatcher, F, Router, BaseMiddleware
+from aiogram import Bot, Dispatcher, Router, F
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode, ChatMemberStatus
+from aiogram.exceptions import (
+    TelegramBadRequest,
+    TelegramForbiddenError,
+    TelegramNetworkError,
+)
 from aiogram.filters import CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import (
-    Message, CallbackQuery, ReplyKeyboardMarkup, KeyboardButton,
-    InlineKeyboardMarkup, InlineKeyboardButton
+    Message,
+    CallbackQuery,
+    InlineKeyboardButton,
+    ReplyKeyboardMarkup,
+    KeyboardButton,
 )
-from aiogram.utils.deep_linking import create_start_link
+from aiogram.utils.keyboard import InlineKeyboardBuilder
 
 
-# =========================================================
-# SOZLAMALAR
-# =========================================================
-
-TOKEN = os.getenv("BOT_TOKEN", "").strip()
-
-# FAQAT SHU USER bosh admin
-OWNER_USERNAME = "omono_v"
-
-# Birinchi majburiy kanal
-DEFAULT_CHANNEL = "@uz_kinocinema"
-
-INSTAGRAM_URL = "https://www.instagram.com/oemovie/"
-
-DB_FILE = "kino.db"
+TOKEN = os.getenv("BOT_TOKEN")
 
 if not TOKEN:
-    raise RuntimeError("BOT_TOKEN Render Environment Variable da topilmadi.")
+    raise RuntimeError("BOT_TOKEN Environment Variable topilmadi.")
 
+SUPERADMIN_USERNAME = "omono_v"
+SUPERADMIN_ID = None
 
-bot = Bot(
-    TOKEN,
-    default=DefaultBotProperties(parse_mode=ParseMode.HTML)
+BOT_USERNAME = "kinocinemauz_bot"
+
+INSTAGRAM_URL = "https://www.instagram.com/oemovie/"
+DEFAULT_CHANNEL = "@uz_kinocinema"
+
+DB_PATH = os.getenv("DB_PATH", "kinocinema.db")
+PORT = int(os.getenv("PORT", "10000"))
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
 )
 
-dp = Dispatcher()
-router = Router()
-
-dp.include_router(router)
+logger = logging.getLogger("KinoCinema")
 
 
-# =========================================================
+# ============================================================
 # DATABASE
-# =========================================================
+# ============================================================
 
-db = sqlite3.connect(DB_FILE, check_same_thread=False)
+db = sqlite3.connect(
+    DB_PATH,
+    check_same_thread=False,
+)
+
 db.row_factory = sqlite3.Row
 
-
-def dbq(sql, params=(), one=False, all=False, commit=False):
-    cur = db.execute(sql, params)
-
-    if commit:
-        db.commit()
-
-    if one:
-        return cur.fetchone()
-
-    if all:
-        return cur.fetchall()
-
-    return cur
+db.execute("PRAGMA journal_mode=WAL")
+db.execute("PRAGMA foreign_keys=ON")
 
 
-def now_iso():
-    return datetime.now(timezone.utc).isoformat()
-
-
-def money(number):
-    return f"{number:,}".replace(",", " ")
-
-
-def get_user(user_id):
-    return dbq(
-        "SELECT * FROM users WHERE user_id=?",
-        (user_id,),
-        one=True
-    )
-
-
-def is_owner(user_id):
-    user = get_user(user_id)
-
-    if not user:
-        return False
-
-    return (
-        (user["username"] or "")
-        .lower()
-        .lstrip("@")
-        == OWNER_USERNAME.lower()
-    )
-
-
-def is_admin(user_id):
-    if is_owner(user_id):
-        return True
-
-    return bool(
-        dbq(
-            "SELECT 1 FROM admins WHERE user_id=?",
-            (user_id,),
-            one=True
-        )
-    )
-
-
-def get_owner_id():
-    row = dbq(
-        """
-        SELECT user_id
-        FROM users
-        WHERE lower(username)=lower(?)
-        ORDER BY created_at
-        LIMIT 1
-        """,
-        (OWNER_USERNAME,),
-        one=True
-    )
-
-    return row["user_id"] if row else None
-
-
-def prime_active(user_id):
-    user = get_user(user_id)
-
-    if not user or not user["prime_until"]:
-        return False
-
-    try:
-        return (
-            datetime.fromisoformat(user["prime_until"])
-            > datetime.now(timezone.utc)
-        )
-    except Exception:
-        return False
-
-
-def normalize_channel(value):
-    value = value.strip()
-
-    if "https://t.me/" in value:
-        value = value.split("https://t.me/", 1)[1]
-        value = value.strip("/")
-
-    if not value.startswith("@"):
-        value = "@" + value
-
-    return value
+def now():
+    return datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
 
 
 def init_db():
@@ -168,260 +79,833 @@ def init_db():
             first_name TEXT,
             prime_until TEXT,
             referred_by INTEGER,
-            created_at TEXT
+            created_at TEXT NOT NULL
         );
 
         CREATE TABLE IF NOT EXISTS admins (
             user_id INTEGER PRIMARY KEY,
             username TEXT,
             added_by INTEGER,
-            created_at TEXT
+            created_at TEXT NOT NULL
         );
 
         CREATE TABLE IF NOT EXISTS channels (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
-            username TEXT UNIQUE,
+            username TEXT UNIQUE NOT NULL,
             title TEXT
         );
 
         CREATE TABLE IF NOT EXISTS cards (
             admin_id INTEGER PRIMARY KEY,
-            card_number TEXT,
-            card_owner TEXT,
-            updated_at TEXT
+            card_number TEXT NOT NULL,
+            card_owner TEXT NOT NULL,
+            updated_at TEXT NOT NULL
         );
 
         CREATE TABLE IF NOT EXISTS movies (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
-            code TEXT UNIQUE,
-            title TEXT,
-            file_id TEXT,
-            prime_only INTEGER DEFAULT 0,
-            views INTEGER DEFAULT 0,
+            code TEXT UNIQUE NOT NULL,
+            title TEXT NOT NULL,
+            file_id TEXT NOT NULL,
+            prime_only INTEGER NOT NULL DEFAULT 0,
+            views INTEGER NOT NULL DEFAULT 0,
             added_by INTEGER,
-            created_at TEXT
+            created_at TEXT NOT NULL
         );
 
         CREATE TABLE IF NOT EXISTS payments (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER,
-            admin_id INTEGER,
-            plan TEXT,
+            user_id INTEGER NOT NULL,
+            admin_id INTEGER NOT NULL,
+            plan TEXT NOT NULL,
             days INTEGER,
-            price INTEGER,
-            status TEXT DEFAULT 'pending',
-            file_id TEXT,
-            created_at TEXT,
+            price INTEGER NOT NULL,
+            status TEXT NOT NULL DEFAULT 'pending',
+            screenshot_file_id TEXT,
+            created_at TEXT NOT NULL,
             decided_at TEXT
         );
 
         CREATE TABLE IF NOT EXISTS referrals (
             user_id INTEGER PRIMARY KEY,
-            admin_id INTEGER,
-            created_at TEXT
+            admin_id INTEGER NOT NULL,
+            created_at TEXT NOT NULL
         );
 
         CREATE TABLE IF NOT EXISTS orders (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER,
-            admin_id INTEGER,
-            text TEXT,
-            created_at TEXT
+            user_id INTEGER NOT NULL,
+            admin_id INTEGER NOT NULL,
+            text TEXT NOT NULL,
+            created_at TEXT NOT NULL
         );
         """
     )
 
     db.execute(
         """
-        INSERT OR IGNORE INTO channels(username,title)
-        VALUES(?,?)
+        INSERT OR IGNORE INTO channels(username, title)
+        VALUES(?, ?)
         """,
         (
             DEFAULT_CHANNEL,
-            "KinoCinema majburiy kanal"
-        )
+            "Uz KinoCinema",
+        ),
     )
 
     db.commit()
 
 
-init_db()
+def get_user(user_id):
+    return db.execute(
+        "SELECT * FROM users WHERE user_id=?",
+        (user_id,),
+    ).fetchone()
 
 
-# =========================================================
-# KEYBOARDS
-# =========================================================
+def upsert_user(tg_user):
+    existing = get_user(tg_user.id)
 
-def keyboard(rows):
-    return ReplyKeyboardMarkup(
-        keyboard=[
-            [KeyboardButton(text=item) for item in row]
-            for row in rows
-        ],
-        resize_keyboard=True
+    if existing:
+        db.execute(
+            """
+            UPDATE users
+            SET username=?,
+                first_name=?
+            WHERE user_id=?
+            """,
+            (
+                tg_user.username,
+                tg_user.first_name,
+                tg_user.id,
+            ),
+        )
+    else:
+        db.execute(
+            """
+            INSERT INTO users(
+                user_id,
+                username,
+                first_name,
+                created_at
+            )
+            VALUES(?,?,?,?)
+            """,
+            (
+                tg_user.id,
+                tg_user.username,
+                tg_user.first_name,
+                now(),
+            ),
+        )
+
+    db.commit()
+
+
+def is_admin(user_id):
+    return (
+        db.execute(
+            "SELECT 1 FROM admins WHERE user_id=?",
+            (user_id,),
+        ).fetchone()
+        is not None
     )
 
 
-def back_keyboard():
-    return keyboard([
-        ["⬅️ Orqaga", "❌ Bekor qilish"]
-    ])
+def is_superadmin(user_id):
+    if SUPERADMIN_ID is not None and user_id == SUPERADMIN_ID:
+        return True
+
+    row = db.execute(
+        """
+        SELECT 1
+        FROM admins
+        WHERE user_id=?
+          AND lower(username)=?
+        """,
+        (
+            user_id,
+            SUPERADMIN_USERNAME.lower(),
+        ),
+    ).fetchone()
+
+    return row is not None
 
 
-def main_keyboard(user_id):
+def add_admin(user_id, username, added_by):
+    db.execute(
+        """
+        INSERT OR REPLACE INTO admins(
+            user_id,
+            username,
+            added_by,
+            created_at
+        )
+        VALUES(?,?,?,?)
+        """,
+        (
+            user_id,
+            username,
+            added_by,
+            now(),
+        ),
+    )
+
+    db.commit()
+
+
+def remove_admin(user_id):
+    db.execute(
+        "DELETE FROM admins WHERE user_id=?",
+        (user_id,),
+    )
+
+    db.commit()
+
+
+# ============================================================
+# REFERRALS
+# ============================================================
+
+def get_referral_admin(user_id):
+    row = db.execute(
+        """
+        SELECT admin_id
+        FROM referrals
+        WHERE user_id=?
+        """,
+        (user_id,),
+    ).fetchone()
+
+    if row:
+        return row["admin_id"]
+
+    return None
+
+
+def set_referral_once(user_id, admin_id):
+    existing = get_referral_admin(user_id)
+
+    if existing is not None:
+        return
+
+    if admin_id == user_id:
+        return
+
+    db.execute(
+        """
+        INSERT OR IGNORE INTO referrals(
+            user_id,
+            admin_id,
+            created_at
+        )
+        VALUES(?,?,?)
+        """,
+        (
+            user_id,
+            admin_id,
+            now(),
+        ),
+    )
+
+    db.execute(
+        """
+        UPDATE users
+        SET referred_by=?
+        WHERE user_id=?
+          AND referred_by IS NULL
+        """,
+        (
+            admin_id,
+            user_id,
+        ),
+    )
+
+    db.commit()
+
+
+# ============================================================
+# CARDS
+# ============================================================
+
+def get_admin_card(admin_id):
+    return db.execute(
+        """
+        SELECT *
+        FROM cards
+        WHERE admin_id=?
+        """,
+        (admin_id,),
+    ).fetchone()
+
+
+def save_card(admin_id, number, owner):
+    db.execute(
+        """
+        INSERT INTO cards(
+            admin_id,
+            card_number,
+            card_owner,
+            updated_at
+        )
+        VALUES(?,?,?,?)
+        ON CONFLICT(admin_id)
+        DO UPDATE SET
+            card_number=excluded.card_number,
+            card_owner=excluded.card_owner,
+            updated_at=excluded.updated_at
+        """,
+        (
+            admin_id,
+            number,
+            owner,
+            now(),
+        ),
+    )
+
+    db.commit()
+
+
+def delete_card(admin_id):
+    db.execute(
+        "DELETE FROM cards WHERE admin_id=?",
+        (admin_id,),
+    )
+
+    db.commit()
+
+
+# ============================================================
+# PRIME
+# ============================================================
+
+def active_prime(user_id):
+    row = get_user(user_id)
+
+    if not row:
+        return False
+
+    if not row["prime_until"]:
+        return False
+
+    try:
+        return datetime.fromisoformat(
+            row["prime_until"]
+        ) > datetime.utcnow()
+    except ValueError:
+        return False
+
+
+def format_prime_date(value):
+    if not value:
+        return "—"
+
+    try:
+        dt = datetime.fromisoformat(value)
+
+        return dt.strftime(
+            "%d.%m.%Y %H:%M"
+        )
+    except ValueError:
+        return value
+
+
+# ============================================================
+# ADMIN STATISTICS
+# ============================================================
+
+def admin_stats(admin_id):
+    referrals = db.execute(
+        """
+        SELECT COUNT(*) AS c
+        FROM referrals
+        WHERE admin_id=?
+        """,
+        (admin_id,),
+    ).fetchone()["c"]
+
+    revenue = db.execute(
+        """
+        SELECT COALESCE(SUM(price),0) AS s
+        FROM payments
+        WHERE admin_id=?
+          AND status='approved'
+        """,
+        (admin_id,),
+    ).fetchone()["s"]
+
+    approved = db.execute(
+        """
+        SELECT COUNT(*) AS c
+        FROM payments
+        WHERE admin_id=?
+          AND status='approved'
+        """,
+        (admin_id,),
+    ).fetchone()["c"]
+
+    pending = db.execute(
+        """
+        SELECT COUNT(*) AS c
+        FROM payments
+        WHERE admin_id=?
+          AND status='pending'
+        """,
+        (admin_id,),
+    ).fetchone()["c"]
+
+    return (
+        referrals,
+        revenue,
+        approved,
+        pending,
+    )
+
+
+# ============================================================
+# KEYBOARDS
+# ============================================================
+
+def main_menu(user_id):
     rows = [
-        ["🔎 Kino qidirish", "⭐ Prime status"],
-        ["📚 Kinolar ro'yxati"],
-        ["📸 Instagramga qaytish"],
-        ["🎬 Kino buyurtma qilish"],
-        ["🤝 Reklama & Bot olish"]
+        [
+            KeyboardButton(text="🔎 Kino qidirish"),
+            KeyboardButton(text="⭐ Prime status"),
+        ],
+        [
+            KeyboardButton(text="📚 Kinolar ro'yxati"),
+        ],
+        [
+            KeyboardButton(text="📸 Instagramga qaytish"),
+        ],
+        [
+            KeyboardButton(text="🎬 Kino buyurtma qilish"),
+        ],
+        [
+            KeyboardButton(text="🤝 Reklama & Bot olish"),
+        ],
     ]
 
     if is_admin(user_id):
-        rows.append(["👨‍💻 Admin panel"])
+        rows.append(
+            [
+                KeyboardButton(text="👨‍💻 Admin panel"),
+            ]
+        )
 
-    return keyboard(rows)
-
-
-def admin_keyboard():
-    return keyboard([
-        ["🎬 Kino qo'shish", "🗑 Kino o'chirish"],
-        ["📚 Kinolar", "📊 Statistika"],
-        ["💳 Karta sozlamalari", "📢 Kanallar"],
-        ["👥 Adminlar", "🔗 Mening referralim"],
-        ["🏠 Asosiy menyu"]
-    ])
-
-
-def card_keyboard():
-    return keyboard([
-        ["➕ Karta qo'shish", "🔄 Kartani almashtirish"],
-        ["👀 Hozirgi kartani ko'rish", "🗑 Kartani o'chirish"],
-        ["⬅️ Admin panel"]
-    ])
-
-
-def channel_keyboard():
-    return keyboard([
-        ["➕ Kanal qo'shish", "🗑 Kanal o'chirish"],
-        ["📋 Kanallar"],
-        ["⬅️ Admin panel"]
-    ])
-
-
-def subscription_keyboard():
-    rows = []
-
-    channels = dbq(
-        "SELECT * FROM channels ORDER BY id",
-        all=True
+    return ReplyKeyboardMarkup(
+        keyboard=rows,
+        resize_keyboard=True,
     )
 
-    for ch in channels:
-        rows.append([
-            InlineKeyboardButton(
-                text="📢 " + (ch["title"] or ch["username"]),
-                url="https://t.me/" + ch["username"].lstrip("@")
-            )
-        ])
 
-    rows.append([
+def back_cancel_keyboard():
+    return ReplyKeyboardMarkup(
+        keyboard=[
+            [
+                KeyboardButton(text="⬅️ Orqaga"),
+                KeyboardButton(text="❌ Bekor qilish"),
+            ]
+        ],
+        resize_keyboard=True,
+    )
+
+
+def admin_menu(user_id):
+    rows = [
+        [
+            KeyboardButton(text="🎬 Kino qo'shish"),
+            KeyboardButton(text="🗑 Kino o'chirish"),
+        ],
+        [
+            KeyboardButton(text="📚 Kinolar"),
+            KeyboardButton(text="📊 Statistika"),
+        ],
+        [
+            KeyboardButton(text="💳 Karta sozlamalari"),
+            KeyboardButton(text="📢 Kanallar"),
+        ],
+        [
+            KeyboardButton(text="🔗 Mening referralim"),
+        ],
+        [
+            KeyboardButton(text="🏠 Asosiy menyu"),
+        ],
+    ]
+
+    if is_superadmin(user_id):
+        rows.insert(
+            3,
+            [
+                KeyboardButton(text="👥 Adminlar"),
+            ],
+        )
+
+    return ReplyKeyboardMarkup(
+        keyboard=rows,
+        resize_keyboard=True,
+    )
+
+
+def card_menu():
+    return ReplyKeyboardMarkup(
+        keyboard=[
+            [
+                KeyboardButton(text="➕ Karta qo'shish"),
+                KeyboardButton(text="🔄 Kartani almashtirish"),
+            ],
+            [
+                KeyboardButton(text="👀 Hozirgi kartani ko'rish"),
+                KeyboardButton(text="🗑 Kartani o'chirish"),
+            ],
+            [
+                KeyboardButton(text="⬅️ Admin panel"),
+            ],
+        ],
+        resize_keyboard=True,
+    )
+
+
+def admin_manage_menu():
+    return ReplyKeyboardMarkup(
+        keyboard=[
+            [
+                KeyboardButton(text="➕ Admin qo'shish"),
+                KeyboardButton(text="🗑 Admin o'chirish"),
+            ],
+            [
+                KeyboardButton(text="📋 Adminlar"),
+                KeyboardButton(text="⬅️ Admin panel"),
+            ],
+        ],
+        resize_keyboard=True,
+    )
+
+
+def channel_menu():
+    return ReplyKeyboardMarkup(
+        keyboard=[
+            [
+                KeyboardButton(text="➕ Kanal qo'shish"),
+                KeyboardButton(text="🗑 Kanal o'chirish"),
+            ],
+            [
+                KeyboardButton(text="📋 Kanallar"),
+                KeyboardButton(text="⬅️ Admin panel"),
+            ],
+        ],
+        resize_keyboard=True,
+    )
+
+
+def inline_subscription_keyboard():
+    builder = InlineKeyboardBuilder()
+
+    builder.row(
+        InlineKeyboardButton(
+            text="📢 Kanalga o'tish",
+            url="https://t.me/uz_kinocinema",
+        )
+    )
+
+    builder.row(
         InlineKeyboardButton(
             text="✅ Obuna bo'ldim",
-            callback_data="subscription_check"
+            callback_data="subscription_check",
         )
-    ])
-
-    return InlineKeyboardMarkup(
-        inline_keyboard=rows
     )
 
+    return builder.as_markup()
 
-# =========================================================
+
+def prime_plans_keyboard():
+    builder = InlineKeyboardBuilder()
+
+    plans = [
+        (
+            "7 kun — 7 000 so'm",
+            "prime:7:7000:7",
+        ),
+        (
+            "1 oy — 20 000 so'm",
+            "prime:1oy:20000:30",
+        ),
+        (
+            "3 oy — 50 000 so'm",
+            "prime:3oy:50000:90",
+        ),
+        (
+            "Umrbod — 150 000 so'm",
+            "prime:lifetime:150000:0",
+        ),
+    ]
+
+    for text, data in plans:
+        builder.row(
+            InlineKeyboardButton(
+                text=text,
+                callback_data=data,
+            )
+        )
+
+    builder.row(
+        InlineKeyboardButton(
+            text="❌ Yopish",
+            callback_data="prime_close",
+        )
+    )
+
+    return builder.as_markup()
+
+
+def payment_decision_keyboard(payment_id):
+    builder = InlineKeyboardBuilder()
+
+    builder.row(
+        InlineKeyboardButton(
+            text="✅ Tasdiqlash",
+            callback_data=f"pay:approve:{payment_id}",
+        ),
+        InlineKeyboardButton(
+            text="❌ Bekor qilish",
+            callback_data=f"pay:reject:{payment_id}",
+        ),
+    )
+
+    return builder.as_markup()
+
+
+# ============================================================
+# FSM STATES
+# ============================================================
+
+class SearchState(StatesGroup):
+    code = State()
+
+
+class CardState(StatesGroup):
+    number = State()
+    owner = State()
+
+
+class MovieAddState(StatesGroup):
+    code = State()
+    title = State()
+    video = State()
+    type = State()
+
+
+class MovieDeleteState(StatesGroup):
+    code = State()
+
+
+class AdminAddState(StatesGroup):
+    user_id = State()
+
+
+class AdminDeleteState(StatesGroup):
+    user_id = State()
+
+
+class ChannelAddState(StatesGroup):
+    username = State()
+
+
+class ChannelDeleteState(StatesGroup):
+    username = State()
+
+
+class PaymentState(StatesGroup):
+    screenshot = State()
+
+
+class OrderState(StatesGroup):
+    text = State()
+
+
+# ============================================================
+# ROUTER
+# ============================================================
+
+router = Router()
+
+
+# ============================================================
 # SUBSCRIPTION
-# =========================================================
+# ============================================================
 
-async def is_subscribed(user_id):
-    channels = dbq(
-        "SELECT username FROM channels",
-        all=True
-    )
+async def subscription_required(
+    bot: Bot,
+    user_id: int,
+) -> bool:
 
-    for ch in channels:
+    if is_admin(user_id):
+        return True
+
+    channels = db.execute(
+        """
+        SELECT username
+        FROM channels
+        ORDER BY id
+        """
+    ).fetchall()
+
+    for row in channels:
+        username = row["username"]
+
         try:
             member = await bot.get_chat_member(
-                ch["username"],
-                user_id
+                username,
+                user_id,
             )
 
             if member.status in {
                 ChatMemberStatus.LEFT,
-                ChatMemberStatus.KICKED
+                ChatMemberStatus.KICKED,
             }:
                 return False
 
+            if (
+                member.status == ChatMemberStatus.RESTRICTED
+                and not getattr(
+                    member,
+                    "is_member",
+                    False,
+                )
+            ):
+                return False
+
+        except (
+            TelegramBadRequest,
+            TelegramForbiddenError,
+            TelegramNetworkError,
+        ):
+            logger.exception(
+                "Kanal obunasi tekshiruvida xato: %s",
+                username,
+            )
+
+            return False
+
         except Exception:
+            logger.exception(
+                "Noma'lum subscription xatosi: %s",
+                username,
+            )
+
             return False
 
     return True
 
 
-async def require_subscription(message):
-    # Adminlar kanal tekshiruvidan o'tadi
-    if is_admin(message.from_user.id):
-        return True
-
-    if await is_subscribed(message.from_user.id):
-        return True
-
+async def show_subscription_block(
+    message: Message,
+):
     await message.answer(
-        "🔒 <b>Avval majburiy kanalga obuna bo'ling.</b>\n\n"
-        "Obuna bo'lgach, "
-        "<b>✅ Obuna bo'ldim</b> tugmasini bosing.",
-        reply_markup=subscription_keyboard()
+        "🔒 Avval majburiy kanalga obuna bo'ling.",
+        reply_markup=inline_subscription_keyboard(),
     )
 
-    return False
 
+class SubscriptionMiddleware:
 
-class SubscriptionMiddleware(BaseMiddleware):
+    async def __call__(
+        self,
+        handler,
+        event,
+        data,
+    ):
+        bot: Bot = data["bot"]
 
-    async def __call__(self, handler, event, data):
-
-        user = getattr(event, "from_user", None)
+        user = getattr(
+            event,
+            "from_user",
+            None,
+        )
 
         if not user:
-            return await handler(event, data)
-
-        # /start ishlashi shart
-        if isinstance(event, Message):
-            if (event.text or "").startswith("/start"):
-                return await handler(event, data)
-
-        # Obuna tekshirish tugmasi ishlashi shart
-        if isinstance(event, CallbackQuery):
-            if event.data == "subscription_check":
-                return await handler(event, data)
-
-        # Adminlar bloklanmaydi
-        if is_admin(user.id):
-            return await handler(event, data)
-
-        # Obuna bor
-        if await is_subscribed(user.id):
-            return await handler(event, data)
-
-        # Obuna yo'q
-        if isinstance(event, CallbackQuery):
-            await event.answer(
-                "❌ Avval kanalga obuna bo'ling.",
-                show_alert=True
+            return await handler(
+                event,
+                data,
             )
-            return
 
-        await event.answer(
-            "🔒 <b>Avval majburiy kanalga obuna bo'ling.</b>",
-            reply_markup=subscription_keyboard()
+        # /start har doim ishlashi kerak.
+        if isinstance(event, Message):
+
+            if (
+                event.text
+                and event.text.startswith("/start")
+            ):
+                return await handler(
+                    event,
+                    data,
+                )
+
+            # FSM cancel/back ishlashi kerak.
+            if event.text in {
+                "❌ Bekor qilish",
+                "⬅️ Orqaga",
+            }:
+                return await handler(
+                    event,
+                    data,
+                )
+
+        # Obuna tekshirish callback har doim ishlashi kerak.
+        if isinstance(event, CallbackQuery):
+
+            if event.data == "subscription_check":
+                return await handler(
+                    event,
+                    data,
+                )
+
+        # Adminlar majburiy obunadan ozod.
+        if is_admin(user.id):
+            return await handler(
+                event,
+                data,
+            )
+
+        subscribed = await subscription_required(
+            bot,
+            user.id,
+        )
+
+        if not subscribed:
+
+            if isinstance(
+                event,
+                CallbackQuery,
+            ):
+                await event.answer(
+                    "🔒 Avval kanalga obuna bo'ling.",
+                    show_alert=True,
+                )
+
+                try:
+                    await event.message.answer(
+                        "🔒 Avval majburiy kanalga obuna bo'ling.",
+                        reply_markup=inline_subscription_keyboard(),
+                    )
+                except Exception:
+                    pass
+
+                return
+
+            if isinstance(
+                event,
+                Message,
+            ):
+                await show_subscription_block(
+                    event
+                )
+
+                return
+
+        return await handler(
+            event,
+            data,
         )
 
 
@@ -434,523 +918,689 @@ router.callback_query.outer_middleware(
 )
 
 
-# =========================================================
-# USER / REFERRAL
-# =========================================================
-
-def ensure_user(message, referred_by=None):
-
-    u = message.from_user
-    old = get_user(u.id)
-
-    if old:
-        dbq(
-            """
-            UPDATE users
-            SET username=?, first_name=?
-            WHERE user_id=?
-            """,
-            (
-                u.username or "",
-                u.first_name or "",
-                u.id
-            ),
-            commit=True
-        )
-
-        return
-
-    dbq(
-        """
-        INSERT INTO users(
-            user_id,
-            username,
-            first_name,
-            prime_until,
-            referred_by,
-            created_at
-        )
-        VALUES(?,?,?,?,?,?)
-        """,
-        (
-            u.id,
-            u.username or "",
-            u.first_name or "",
-            None,
-            referred_by,
-            now_iso()
-        ),
-        commit=True
-    )
-
-    if referred_by:
-        dbq(
-            """
-            INSERT OR IGNORE INTO referrals(
-                user_id,
-                admin_id,
-                created_at
-            )
-            VALUES(?,?,?)
-            """,
-            (
-                u.id,
-                referred_by,
-                now_iso()
-            ),
-            commit=True
-        )
-
-
-def payment_admin(user_id):
-
-    row = dbq(
-        """
-        SELECT admin_id
-        FROM referrals
-        WHERE user_id=?
-        """,
-        (user_id,),
-        one=True
-    )
-
-    if row and is_admin(row["admin_id"]):
-        return row["admin_id"]
-
-    return get_owner_id()
-
-
-# =========================================================
-# FSM
-# =========================================================
-
-class SearchState(StatesGroup):
-    code = State()
-
-
-class MovieAddState(StatesGroup):
-    code = State()
-    title = State()
-    video = State()
-    kind = State()
-
-
-class MovieDeleteState(StatesGroup):
-    code = State()
-
-
-class CardState(StatesGroup):
-    number = State()
-    owner = State()
-
-
-class ChannelAddState(StatesGroup):
-    username = State()
-
-
-class ChannelDeleteState(StatesGroup):
-    username = State()
-
-
-class AdminAddState(StatesGroup):
-    user_id = State()
-
-
-class AdminDeleteState(StatesGroup):
-    user_id = State()
-
-
-class PaymentState(StatesGroup):
-    screenshot = State()
-
-
-class OrderState(StatesGroup):
-    text = State()
-
-
-# =========================================================
+# ============================================================
 # START
-# =========================================================
+# ============================================================
 
 @router.message(CommandStart())
-async def start(message: Message, state: FSMContext):
+async def start_handler(
+    message: Message,
+    state: FSMContext,
+    bot: Bot,
+):
+    global SUPERADMIN_ID
 
     await state.clear()
 
-    ref = None
+    upsert_user(
+        message.from_user
+    )
 
-    parts = (message.text or "").split(maxsplit=1)
+    # @omono_v yagona superadmin.
+    if (
+        message.from_user.username
+        and message.from_user.username.lower()
+        == SUPERADMIN_USERNAME.lower()
+    ):
+        SUPERADMIN_ID = message.from_user.id
 
-    if len(parts) == 2:
-        arg = parts[1].strip()
+        add_admin(
+            message.from_user.id,
+            SUPERADMIN_USERNAME,
+            message.from_user.id,
+        )
 
-        if arg.startswith("ref_"):
-            try:
-                ref = int(arg[4:])
-            except Exception:
-                ref = None
+    # Referral parametrini olish.
+    args = message.text.split(
+        maxsplit=1
+    )
 
-    ensure_user(message, ref)
+    if (
+        len(args) > 1
+        and args[1].startswith("ref_")
+    ):
+        try:
+            ref_admin = int(
+                args[1][4:]
+            )
 
-    if not await require_subscription(message):
+            if is_admin(ref_admin):
+                set_referral_once(
+                    message.from_user.id,
+                    ref_admin,
+                )
+
+        except ValueError:
+            pass
+
+    # Adminlar obunadan ozod.
+    if is_admin(message.from_user.id):
+        await message.answer(
+            "🎬 KinoCinema botiga xush kelibsiz!\n\n"
+            "Kerakli bo'limni tanlang:",
+            reply_markup=main_menu(
+                message.from_user.id
+            ),
+        )
+
+        return
+
+    # Oddiy user subscription tekshiruvi.
+    if not await subscription_required(
+        bot,
+        message.from_user.id,
+    ):
+        await message.answer(
+            "🔒 Avval majburiy kanalga obuna bo'ling.",
+            reply_markup=inline_subscription_keyboard(),
+        )
+
         return
 
     await message.answer(
-        "🎬 <b>KinoCinema botiga xush kelibsiz!</b>\n\n"
+        "🎬 KinoCinema botiga xush kelibsiz!\n\n"
         "Kerakli bo'limni tanlang:",
-        reply_markup=main_keyboard(message.from_user.id)
+        reply_markup=main_menu(
+            message.from_user.id
+        ),
     )
 
 
-@router.callback_query(F.data == "subscription_check")
-async def subscription_check(
+# ============================================================
+# SUBSCRIPTION CALLBACK
+# ============================================================
+
+@router.callback_query(
+    F.data == "subscription_check"
+)
+async def subscription_check_callback(
     callback: CallbackQuery,
-    state: FSMContext
+    bot: Bot,
+    state: FSMContext,
 ):
-
-    await callback.answer()
-
-    if await is_subscribed(callback.from_user.id):
+    if await subscription_required(
+        bot,
+        callback.from_user.id,
+    ):
+        await callback.answer(
+            "✅ Obuna tasdiqlandi!",
+            show_alert=True,
+        )
 
         await state.clear()
 
-        await callback.message.answer(
-            "✅ <b>Obuna tasdiqlandi!</b>\n\n"
-            "Kerakli bo'limni tanlang.",
-            reply_markup=main_keyboard(
-                callback.from_user.id
+        try:
+            await callback.message.edit_text(
+                "✅ Obuna tasdiqlandi!"
             )
+        except Exception:
+            pass
+
+        await callback.message.answer(
+            "🎬 KinoCinema botiga xush kelibsiz!\n\n"
+            "Kerakli bo'limni tanlang:",
+            reply_markup=main_menu(
+                callback.from_user.id
+            ),
+        )
+
+    else:
+        await callback.answer(
+            "❌ Hali kanalga obuna bo'lmagansiz.",
+            show_alert=True,
+        )
+
+
+# ============================================================
+# CANCEL
+# ============================================================
+
+@router.message(
+    F.text == "❌ Bekor qilish"
+)
+async def cancel_handler(
+    message: Message,
+    state: FSMContext,
+):
+    current = await state.get_state()
+
+    await state.clear()
+
+    if current and current.startswith(
+        "CardState"
+    ):
+        await message.answer(
+            "❌ Bekor qilindi.",
+            reply_markup=card_menu(),
+        )
+
+    elif current and current.startswith(
+        (
+            "MovieAddState",
+            "MovieDeleteState",
+            "AdminAddState",
+            "AdminDeleteState",
+            "ChannelAddState",
+            "ChannelDeleteState",
+        )
+    ):
+        await message.answer(
+            "❌ Bekor qilindi.",
+            reply_markup=admin_menu(
+                message.from_user.id
+            ),
+        )
+
+    elif current and current.startswith(
+        "PaymentState"
+    ):
+        await message.answer(
+            "❌ To'lov bekor qilindi.",
+            reply_markup=main_menu(
+                message.from_user.id
+            ),
+        )
+
+    elif current and current.startswith(
+        "OrderState"
+    ):
+        await message.answer(
+            "❌ Buyurtma bekor qilindi.",
+            reply_markup=main_menu(
+                message.from_user.id
+            ),
+        )
+
+    elif current and current.startswith(
+        "SearchState"
+    ):
+        await message.answer(
+            "❌ Qidiruv bekor qilindi.",
+            reply_markup=main_menu(
+                message.from_user.id
+            ),
+        )
+
+    else:
+        await message.answer(
+            "🏠 Asosiy menyu",
+            reply_markup=main_menu(
+                message.from_user.id
+            ),
+        )
+
+
+# ============================================================
+# BACK
+# ============================================================
+
+@router.message(
+    F.text == "⬅️ Orqaga"
+)
+async def back_handler(
+    message: Message,
+    state: FSMContext,
+):
+    current = await state.get_state()
+
+    if current is None:
+        await message.answer(
+            "🏠 Asosiy menyu",
+            reply_markup=main_menu(
+                message.from_user.id
+            ),
+        )
+
+        return
+
+    if current == SearchState.code.state:
+
+        await state.clear()
+
+        await message.answer(
+            "🏠 Asosiy menyu",
+            reply_markup=main_menu(
+                message.from_user.id
+            ),
+        )
+
+    elif current == CardState.owner.state:
+
+        await state.set_state(
+            CardState.number
+        )
+
+        await message.answer(
+            "💳 Karta raqamini yuboring.\n\n"
+            "Masalan:\n"
+            "9860600435412504",
+            reply_markup=back_cancel_keyboard(),
+        )
+
+    elif current == CardState.number.state:
+
+        await state.clear()
+
+        await message.answer(
+            "💳 Karta sozlamalari",
+            reply_markup=card_menu(),
+        )
+
+    elif current == MovieAddState.title.state:
+
+        await state.set_state(
+            MovieAddState.code
+        )
+
+        await message.answer(
+            "🎬 Kino qo'shish — 1/4\n\n"
+            "Kino kodini yuboring.",
+            reply_markup=back_cancel_keyboard(),
+        )
+
+    elif current == MovieAddState.video.state:
+
+        await state.set_state(
+            MovieAddState.title
+        )
+
+        await message.answer(
+            "🎬 Kino qo'shish — 2/4\n\n"
+            "Kino nomini yuboring.",
+            reply_markup=back_cancel_keyboard(),
+        )
+
+    elif current == MovieAddState.type.state:
+
+        await state.set_state(
+            MovieAddState.video
+        )
+
+        await message.answer(
+            "🎬 Kino qo'shish — 3/4\n\n"
+            "Kino videosini yuboring.",
+            reply_markup=back_cancel_keyboard(),
+        )
+
+    elif current == MovieAddState.code.state:
+
+        await state.clear()
+
+        await message.answer(
+            "👨‍💻 Admin panel",
+            reply_markup=admin_menu(
+                message.from_user.id
+            ),
+        )
+
+    elif current == MovieDeleteState.code.state:
+
+        await state.clear()
+
+        await message.answer(
+            "👨‍💻 Admin panel",
+            reply_markup=admin_menu(
+                message.from_user.id
+            ),
+        )
+
+    elif current in {
+        AdminAddState.user_id.state,
+        AdminDeleteState.user_id.state,
+    }:
+
+        await state.clear()
+
+        await message.answer(
+            "👥 Adminlar",
+            reply_markup=admin_manage_menu(),
+        )
+
+    elif current in {
+        ChannelAddState.username.state,
+        ChannelDeleteState.username.state,
+    }:
+
+        await state.clear()
+
+        await message.answer(
+            "📢 Kanallar",
+            reply_markup=channel_menu(),
+        )
+
+    elif current == OrderState.text.state:
+
+        await state.clear()
+
+        await message.answer(
+            "🏠 Asosiy menyu",
+            reply_markup=main_menu(
+                message.from_user.id
+            ),
+        )
+
+    elif current == PaymentState.screenshot.state:
+
+        await state.clear()
+
+        await message.answer(
+            "🏠 Asosiy menyu",
+            reply_markup=main_menu(
+                message.from_user.id
+            ),
         )
 
     else:
 
-        await callback.message.answer(
-            "❌ Hali majburiy kanalga obuna bo'lmagansiz.",
-            reply_markup=subscription_keyboard()
+        await state.clear()
+
+        await message.answer(
+            "🏠 Asosiy menyu",
+            reply_markup=main_menu(
+                message.from_user.id
+            ),
         )
 
 
-# =========================================================
-# BACK / CANCEL
-# =========================================================
+# ============================================================
+# KINO QIDIRISH
+# ============================================================
 
 @router.message(
-    F.text.in_({
-        "⬅️ Orqaga",
-        "❌ Bekor qilish"
-    })
+    F.text == "🔎 Kino qidirish"
 )
-async def back_cancel(
+async def search_start(
     message: Message,
-    state: FSMContext
+    state: FSMContext,
 ):
-
-    await state.clear()
-
-    if (
-        message.text == "⬅️ Orqaga"
-        and is_admin(message.from_user.id)
-    ):
-        await message.answer(
-            "👨‍💻 <b>Admin panel</b>",
-            reply_markup=admin_keyboard()
-        )
-        return
-
-    await message.answer(
-        "↩️ Bekor qilindi.",
-        reply_markup=main_keyboard(
-            message.from_user.id
-        )
-    )
-
-
-@router.message(F.text == "🏠 Asosiy menyu")
-async def home(
-    message: Message,
-    state: FSMContext
-):
-
-    await state.clear()
-
-    await message.answer(
-        "🏠 <b>Asosiy menyu</b>",
-        reply_markup=main_keyboard(
-            message.from_user.id
-        )
-    )
-
-
-# =========================================================
-# MOVIE SEARCH
-# =========================================================
-
-@router.message(F.text == "🔎 Kino qidirish")
-async def movie_search_start(
-    message: Message,
-    state: FSMContext
-):
-
     await state.set_state(
         SearchState.code
     )
 
     await message.answer(
-        "🔎 <b>Kino kodini yuboring.</b>\n\n"
-        "Masalan: <code>247</code>",
-        reply_markup=back_keyboard()
+        "🔎 Kino kodini yuboring.\n\n"
+        "Masalan:\n"
+        "247",
+        reply_markup=back_cancel_keyboard(),
     )
 
 
-@router.message(SearchState.code, F.text)
-async def movie_search_code(
+async def send_movie_by_code(
     message: Message,
-    state: FSMContext
+    code: str,
+    bot: Bot,
 ):
+    code = code.strip()
 
-    code = message.text.strip()
-
-    movie = dbq(
+    movie = db.execute(
         """
         SELECT *
         FROM movies
-        WHERE lower(code)=lower(?)
+        WHERE code=?
         """,
         (code,),
-        one=True
-    )
-
-    await state.clear()
+    ).fetchone()
 
     if not movie:
+        return False
 
-        await message.answer(
-            "❌ Bunday kino topilmadi.",
-            reply_markup=main_keyboard(
-                message.from_user.id
-            )
+    if (
+        movie["prime_only"]
+        and not active_prime(
+            message.from_user.id
         )
-        return
-
-    if movie["prime_only"] and not prime_active(
-        message.from_user.id
+        and not is_admin(
+            message.from_user.id
+        )
     ):
-
         await message.answer(
-            "⭐ Bu kino faqat Prime uchun.",
-            reply_markup=main_keyboard(
-                message.from_user.id
-            )
+            "⭐ Bu kino faqat Prime uchun."
         )
-        return
 
-    dbq(
+        return True
+
+    db.execute(
         """
         UPDATE movies
         SET views=views+1
         WHERE id=?
         """,
         (movie["id"],),
-        commit=True
     )
 
-    await bot.send_video(
-        message.chat.id,
-        movie["file_id"],
-        caption=(
-            f"🎬 <b>{movie['title']}</b>\n"
-            f"🔢 Kod: <code>{movie['code']}</code>\n\n"
-            "🍿 Yoqimli tomosha!"
+    db.commit()
+
+    caption = (
+        f"🎬 {escape(movie['title'])}\n"
+        f"🔢 Kod: {escape(movie['code'])}\n\n"
+        "🍿 Yoqimli tomosha!"
+    )
+
+    try:
+        await message.answer_video(
+            video=movie["file_id"],
+            caption=caption,
         )
-    )
 
-
-# =========================================================
-# MOVIE LIST
-# =========================================================
-
-@router.message(F.text == "📚 Kinolar ro'yxati")
-async def movie_list(message: Message):
-
-    movies = dbq(
-        """
-        SELECT code,title,prime_only,views
-        FROM movies
-        ORDER BY id DESC
-        """,
-        all=True
-    )
-
-    if not movies:
+    except Exception:
+        logger.exception(
+            "Video yuborishda xato"
+        )
 
         await message.answer(
-            "📚 Hozircha kino yo'q."
-        )
-        return
-
-    text = "📚 <b>Kinolar ro'yxati</b>\n\n"
-
-    for movie in movies:
-
-        star = "⭐ " if movie["prime_only"] else ""
-
-        text += (
-            f"{star}<code>{movie['code']}</code> — "
-            f"{movie['title']} | 👁 {movie['views']}\n"
+            "❌ Videoni yuborishda xatolik yuz berdi. "
+            "Keyinroq urinib ko'ring."
         )
 
-    await message.answer(text)
-
-
-# =========================================================
-# PRIME
-# =========================================================
-
-PLANS = {
-    "7 kun": (7, 7000),
-    "1 oy": (30, 20000),
-    "3 oy": (90, 50000),
-    "Umrbod": (36500, 150000)
-}
-
-
-@router.message(F.text == "⭐ Prime status")
-async def prime_status(message: Message):
-
-    if prime_active(message.from_user.id):
-
-        user = get_user(message.from_user.id)
-
-        await message.answer(
-            "⭐ <b>Prime status</b>\n\n"
-            f"✅ Faol\n"
-            f"📅 Tugash vaqti:\n"
-            f"<code>{user['prime_until']}</code>",
-            reply_markup=keyboard([
-                ["💳 Prime sotib olish"],
-                ["🏠 Asosiy menyu"]
-            ])
-        )
-
-    else:
-
-        await message.answer(
-            "⭐ <b>Prime status</b>\n\n"
-            "❌ Prime faol emas.",
-            reply_markup=keyboard([
-                ["💳 Prime sotib olish"],
-                ["🏠 Asosiy menyu"]
-            ])
-        )
-
-
-@router.message(F.text == "💳 Prime sotib olish")
-async def prime_buy(message: Message):
-
-    rows = []
-
-    for name, (_, price) in PLANS.items():
-
-        rows.append([
-            KeyboardButton(
-                text=f"{name} — {money(price)} so'm"
-            )
-        ])
-
-    rows.append([
-        KeyboardButton(
-            text="🏠 Asosiy menyu"
-        )
-    ])
-
-    await message.answer(
-        "⭐ <b>Prime tarifini tanlang:</b>",
-        reply_markup=ReplyKeyboardMarkup(
-            keyboard=rows,
-            resize_keyboard=True
-        )
-    )
+    return True
 
 
 @router.message(
-    F.text.regexp(
-        r"^(7 kun|1 oy|3 oy|Umrbod) — "
-    )
+    SearchState.code,
+    F.text,
 )
-async def choose_plan(
+async def search_code_handler(
     message: Message,
-    state: FSMContext
+    state: FSMContext,
+    bot: Bot,
 ):
+    code = message.text.strip()
 
-    plan_name = message.text.split(" — ")[0]
+    if not code.isdigit():
+        await message.answer(
+            "❌ Kino kodi faqat raqamlardan iborat "
+            "bo'lishi kerak."
+        )
 
-    days, price = PLANS[plan_name]
+        return
 
-    admin_id = payment_admin(
+    found = await send_movie_by_code(
+        message,
+        code,
+        bot,
+    )
+
+    if not found:
+        await message.answer(
+            "❌ Bunday kino topilmadi."
+        )
+
+
+# ============================================================
+# PRIME STATUS
+# ============================================================
+
+@router.message(
+    F.text == "⭐ Prime status"
+)
+async def prime_status(
+    message: Message,
+):
+    row = get_user(
         message.from_user.id
     )
 
-    if not admin_id:
-
+    if active_prime(
+        message.from_user.id
+    ):
         await message.answer(
-            "❌ Admin topilmadi."
+            "⭐ Prime status\n\n"
+            "✅ Faol\n\n"
+            f"📅 Tugash sanasi:\n"
+            f"{format_prime_date(row['prime_until'])}"
         )
+
+    else:
+        await message.answer(
+            "⭐ Prime status\n\n"
+            "❌ Prime faol emas.",
+            reply_markup=prime_plans_keyboard(),
+        )
+
+
+# ============================================================
+# PRIME PLAN
+# ============================================================
+
+@router.callback_query(
+    F.data.startswith("prime:")
+)
+async def prime_plan_callback(
+    callback: CallbackQuery,
+    state: FSMContext,
+):
+    try:
+        (
+            _,
+            plan,
+            price_text,
+            days_text,
+        ) = callback.data.split(":")
+
+        price = int(price_text)
+        days = int(days_text)
+
+    except (
+        ValueError,
+        AttributeError,
+    ):
+        await callback.answer(
+            "❌ Tarif ma'lumotida xato.",
+            show_alert=True,
+        )
+
         return
 
-    card = dbq(
-        """
-        SELECT *
-        FROM cards
-        WHERE admin_id=?
-        """,
-        (admin_id,),
-        one=True
+    admin_id = (
+        get_referral_admin(
+            callback.from_user.id
+        )
+        or SUPERADMIN_ID
+    )
+
+    if not admin_id:
+        await callback.answer(
+            "❌ Mas'ul admin aniqlanmadi.",
+            show_alert=True,
+        )
+
+        return
+
+    card = get_admin_card(
+        admin_id
     )
 
     if not card:
-
-        await message.answer(
-            "❌ Sizga xizmat ko'rsatuvchi admin "
-            "hali karta qo'shmagan."
+        await callback.answer(
+            "❌ Bu admin uchun karta hali "
+            "sozlanmagan.",
+            show_alert=True,
         )
+
         return
 
-    await state.update_data(
-        plan=plan_name,
-        days=days,
-        price=price,
-        admin_id=admin_id
+    plan_names = {
+        "7": "7 kun",
+        "1oy": "1 oy",
+        "3oy": "3 oy",
+        "lifetime": "Umrbod",
+    }
+
+    plan_name = plan_names.get(
+        plan,
+        plan,
     )
 
     await state.set_state(
         PaymentState.screenshot
     )
 
-    await message.answer(
-        "💳 <b>To'lov ma'lumotlari</b>\n\n"
-        f"💳 Karta: <code>{card['card_number']}</code>\n"
-        f"👤 Egasi: <b>{card['card_owner']}</b>\n"
-        f"💰 Narx: <b>{money(price)} so'm</b>\n\n"
-        "📸 To'lov screenshotini "
-        "<b>rasm ko'rinishida</b> yuboring.",
-        reply_markup=back_keyboard()
+    await state.update_data(
+        admin_id=admin_id,
+        plan=plan_name,
+        days=days,
+        price=price,
+    )
+
+    await callback.answer()
+
+    await callback.message.answer(
+        "💳 To'lov ma'lumotlari\n\n"
+        f"💳 Karta: {escape(card['card_number'])}\n"
+        f"👤 Egasi: {escape(card['card_owner'])}\n"
+        f"💰 Narx: {price:,} so'm\n\n"
+        "📸 To'lov screenshotini RASM "
+        "ko'rinishida yuboring.",
+        reply_markup=back_cancel_keyboard(),
     )
 
 
+@router.callback_query(
+    F.data == "prime_close"
+)
+async def prime_close_callback(
+    callback: CallbackQuery,
+):
+    await callback.answer()
+
+    try:
+        await callback.message.delete()
+    except Exception:
+        pass
+
+
+# ============================================================
+# PAYMENT SCREENSHOT
+# ============================================================
+
 @router.message(
     PaymentState.screenshot,
-    F.photo
+    F.photo,
 )
-async def payment_screenshot(
+async def payment_screenshot_handler(
     message: Message,
-    state: FSMContext
+    state: FSMContext,
+    bot: Bot,
 ):
-
     data = await state.get_data()
 
-    file_id = message.photo[-1].file_id
+    admin_id = data.get(
+        "admin_id"
+    )
 
-    cur = dbq(
+    if not admin_id:
+        await state.clear()
+
+        await message.answer(
+            "❌ To'lov ma'lumotlari topilmadi.",
+            reply_markup=main_menu(
+                message.from_user.id
+            ),
+        )
+
+        return
+
+    payment_id = db.execute(
         """
         INSERT INTO payments(
             user_id,
@@ -959,1322 +1609,473 @@ async def payment_screenshot(
             days,
             price,
             status,
-            file_id,
+            screenshot_file_id,
             created_at
         )
         VALUES(?,?,?,?,?,?,?,?)
         """,
         (
             message.from_user.id,
-            data["admin_id"],
+            admin_id,
             data["plan"],
             data["days"],
             data["price"],
             "pending",
-            file_id,
-            now_iso()
+            message.photo[-1].file_id,
+            now(),
         ),
-        commit=True
-    )
+    ).lastrowid
 
-    payment_id = cur.lastrowid
+    db.commit()
 
     await state.clear()
 
-    buttons = InlineKeyboardMarkup(
-        inline_keyboard=[
-            [
-                InlineKeyboardButton(
-                    text="✅ Tasdiqlash",
-                    callback_data=f"payment_ok_{payment_id}"
-                ),
-                InlineKeyboardButton(
-                    text="❌ Bekor qilish",
-                    callback_data=f"payment_no_{payment_id}"
-                )
-            ]
-        ]
-    )
-
     caption = (
-        "🧾 <b>Yangi PRIME to'lov!</b>\n\n"
-        f"👤 User ID: <code>{message.from_user.id}</code>\n"
-        f"📦 Plan: <b>{data['plan']}</b>\n"
-        f"📅 Muddat: <b>{data['days']} kun</b>\n"
-        f"💰 Narx: <b>{money(data['price'])} so'm</b>\n"
-        f"🆔 Payment ID: <code>{payment_id}</code>"
+        "🧾 Yangi PRIME to'lov!\n\n"
+        f"👤 User ID: {message.from_user.id}\n"
+        f"📦 Plan: {data['plan']}\n"
+        f"📅 Muddat: "
+        f"{'Umrbod' if data['days'] == 0 else str(data['days']) + ' kun'}\n"
+        f"💰 Narx: {data['price']:,} so'm"
     )
 
     try:
-
         await bot.send_photo(
-            data["admin_id"],
-            file_id,
+            chat_id=admin_id,
+            photo=message.photo[-1].file_id,
             caption=caption,
-            reply_markup=buttons
+            reply_markup=payment_decision_keyboard(
+                payment_id
+            ),
+        )
+
+        await message.answer(
+            "✅ Screenshot qabul qilindi.\n\n"
+            "Admin tekshirganidan keyin "
+            "natija yuboriladi.",
+            reply_markup=main_menu(
+                message.from_user.id
+            ),
+        )
+
+    except (
+        TelegramForbiddenError,
+        TelegramBadRequest,
+    ):
+        logger.exception(
+            "Payment adminiga yuborilmadi: %s",
+            admin_id,
+        )
+
+        await message.answer(
+            "⚠️ To'lov qabul qilindi, ammo "
+            "mas'ul adminga xabar yuborilmadi.\n\n"
+            "Admin botga /start yuborishi kerak.",
+            reply_markup=main_menu(
+                message.from_user.id
+            ),
         )
 
     except Exception:
-        pass
-
-    await message.answer(
-        "⏳ <b>To'lovingiz tekshirilmoqda.</b>\n\n"
-        "Admin tasdiqlagandan keyin Prime avtomatik ochiladi.",
-        reply_markup=main_keyboard(
-            message.from_user.id
+        logger.exception(
+            "Payment yuborishda kutilmagan xato"
         )
-    )
+
+        await message.answer(
+            "⚠️ To'lov saqlandi, ammo adminga "
+            "yuborishda xato yuz berdi.",
+            reply_markup=main_menu(
+                message.from_user.id
+            ),
+        )
 
 
-@router.message(PaymentState.screenshot)
-async def wrong_payment_file(
-    message: Message
+@router.message(
+    PaymentState.screenshot
+)
+async def payment_wrong_type(
+    message: Message,
 ):
-
     await message.answer(
-        "❌ Iltimos, to'lov screenshotini "
-        "<b>rasm</b> sifatida yuboring.",
-        reply_markup=back_keyboard()
+        "📸 Iltimos, to'lov screenshotini "
+        "RASM ko'rinishida yuboring."
     )
 
 
-# =========================================================
+# ============================================================
 # PAYMENT APPROVE / REJECT
-# =========================================================
+# ============================================================
 
 @router.callback_query(
-    F.data.regexp(
-        r"^payment_(ok|no)_\d+$"
-    )
+    F.data.startswith("pay:")
 )
-async def payment_decision(
-    callback: CallbackQuery
+async def payment_decision_callback(
+    callback: CallbackQuery,
+    bot: Bot,
 ):
+    parts = callback.data.split(":")
 
-    parts = callback.data.split("_")
+    if len(parts) != 3:
+        await callback.answer(
+            "❌ Noto'g'ri callback.",
+            show_alert=True,
+        )
+
+        return
 
     action = parts[1]
-    payment_id = int(parts[2])
 
-    payment = dbq(
+    try:
+        payment_id = int(parts[2])
+    except ValueError:
+        await callback.answer(
+            "❌ Payment ID xato.",
+            show_alert=True,
+        )
+
+        return
+
+    payment = db.execute(
         """
         SELECT *
         FROM payments
         WHERE id=?
         """,
         (payment_id,),
-        one=True
-    )
+    ).fetchone()
 
     if not payment:
-
         await callback.answer(
             "❌ To'lov topilmadi.",
-            show_alert=True
+            show_alert=True,
         )
+
         return
 
+    # Payment faqat o'z adminiga tegishli.
     if payment["admin_id"] != callback.from_user.id:
-
         await callback.answer(
-            "❌ Bu to'lov sizga tegishli emas.",
-            show_alert=True
+            "❌ Bu to'lov sizga biriktirilmagan.",
+            show_alert=True,
         )
+
         return
 
+    # Ikkinchi marta approve/reject bo'lmaydi.
     if payment["status"] != "pending":
-
         await callback.answer(
-            "Bu to'lov allaqachon ko'rilgan.",
-            show_alert=True
+            "ℹ️ Bu to'lov allaqachon "
+            "ko'rib chiqilgan.",
+            show_alert=True,
         )
+
         return
 
-    if action == "ok":
+    # --------------------------------------------------------
+    # APPROVE
+    # --------------------------------------------------------
+
+    if action == "approve":
 
         user = get_user(
             payment["user_id"]
         )
 
-        old_until = None
+        if not user:
+            await callback.answer(
+                "❌ User topilmadi.",
+                show_alert=True,
+            )
 
-        if user and user["prime_until"]:
+            return
 
-            try:
-                old_until = datetime.fromisoformat(
-                    user["prime_until"]
+        # Umrbod.
+        if payment["days"] == 0:
+
+            prime_until = (
+                "9999-12-31 23:59:59"
+            )
+
+        else:
+
+            base = datetime.utcnow()
+
+            if user["prime_until"]:
+
+                try:
+                    existing = datetime.fromisoformat(
+                        user["prime_until"]
+                    )
+
+                    if existing > base:
+                        base = existing
+
+                except ValueError:
+                    pass
+
+            prime_until = (
+                base
+                + timedelta(
+                    days=payment["days"]
                 )
-            except Exception:
-                old_until = None
+            ).strftime(
+                "%Y-%m-%d %H:%M:%S"
+            )
 
-        base = max(
-            old_until or datetime.now(timezone.utc),
-            datetime.now(timezone.utc)
+        # Atomik holatda pending bo'lsa approve.
+        cur = db.execute(
+            """
+            UPDATE payments
+            SET status='approved',
+                decided_at=?
+            WHERE id=?
+              AND status='pending'
+              AND admin_id=?
+            """,
+            (
+                now(),
+                payment_id,
+                callback.from_user.id,
+            ),
         )
 
-        until = (
-            base +
-            timedelta(days=payment["days"])
-        ).isoformat()
+        if cur.rowcount != 1:
+            await callback.answer(
+                "ℹ️ Bu to'lov allaqachon "
+                "ko'rib chiqilgan.",
+                show_alert=True,
+            )
 
-        dbq(
+            return
+
+        db.execute(
             """
             UPDATE users
             SET prime_until=?
             WHERE user_id=?
             """,
             (
-                until,
-                payment["user_id"]
-            ),
-            commit=True
-        )
-
-        dbq(
-            """
-            UPDATE payments
-            SET status='approved',
-                decided_at=?
-            WHERE id=?
-            """,
-            (
-                now_iso(),
-                payment_id
-            ),
-            commit=True
-        )
-
-        try:
-
-            await bot.send_message(
+                prime_until,
                 payment["user_id"],
-                "✅ <b>To'lov tasdiqlandi!</b>\n\n"
-                f"⭐ Prime: <b>{payment['plan']}</b>\n"
-                f"📅 Muddat: <code>{until}</code>"
-            )
+            ),
+        )
 
-        except Exception:
-            pass
-
-        try:
-            await callback.message.edit_caption(
-                caption=(
-                    (callback.message.caption or "")
-                    + "\n\n✅ <b>TASDIQLANDI</b>"
-                )
-            )
-        except Exception:
-            pass
+        db.commit()
 
         await callback.answer(
-            "✅ Prime ochildi."
+            "✅ To'lov tasdiqlandi."
         )
 
-    else:
+        try:
+            await callback.message.edit_reply_markup(
+                reply_markup=None
+            )
+        except Exception:
+            pass
 
-        dbq(
+        try:
+            await bot.send_message(
+                payment["user_id"],
+                "✅ To'lov tasdiqlandi!\n\n"
+                f"⭐ Prime: {payment['plan']}\n"
+                f"📅 Tugash sanasi: "
+                f"{format_prime_date(prime_until)}",
+            )
+
+        except Exception:
+            logger.exception(
+                "Prime userga yuborilmadi"
+            )
+
+        return
+
+    # --------------------------------------------------------
+    # REJECT
+    # --------------------------------------------------------
+
+    if action == "reject":
+
+        cur = db.execute(
             """
             UPDATE payments
             SET status='rejected',
                 decided_at=?
             WHERE id=?
+              AND status='pending'
+              AND admin_id=?
             """,
             (
-                now_iso(),
-                payment_id
+                now(),
+                payment_id,
+                callback.from_user.id,
             ),
-            commit=True
         )
 
-        try:
-
-            await bot.send_message(
-                payment["user_id"],
-                "❌ <b>To'lov bekor qilindi.</b>\n\n"
-                "Prime ochilmadi."
+        if cur.rowcount != 1:
+            await callback.answer(
+                "ℹ️ Bu to'lov allaqachon "
+                "ko'rib chiqilgan.",
+                show_alert=True,
             )
 
-        except Exception:
-            pass
+            return
 
-        try:
-            await callback.message.edit_caption(
-                caption=(
-                    (callback.message.caption or "")
-                    + "\n\n❌ <b>BEKOR QILINDI</b>"
-                )
-            )
-        except Exception:
-            pass
+        db.commit()
 
         await callback.answer(
             "❌ To'lov bekor qilindi."
         )
 
-
-# =========================================================
-# ADMIN PANEL
-# =========================================================
-
-@router.message(F.text == "👨‍💻 Admin panel")
-async def admin_panel(
-    message: Message,
-    state: FSMContext
-):
-
-    if not is_admin(message.from_user.id):
-        return
-
-    await state.clear()
-
-    await message.answer(
-        "👨‍💻 <b>Admin panel</b>\n\n"
-        "Kerakli bo'limni tanlang:",
-        reply_markup=admin_keyboard()
-    )
-
-
-# =========================================================
-# CARD SETTINGS
-# =========================================================
-
-@router.message(F.text == "💳 Karta sozlamalari")
-async def card_settings(
-    message: Message,
-    state: FSMContext
-):
-
-    if not is_admin(message.from_user.id):
-        return
-
-    await state.clear()
-
-    card = dbq(
-        """
-        SELECT *
-        FROM cards
-        WHERE admin_id=?
-        """,
-        (message.from_user.id,),
-        one=True
-    )
-
-    if card:
-
-        text = (
-            "💳 <b>Sizning kartangiz</b>\n\n"
-            f"💳 <code>{card['card_number']}</code>\n"
-            f"👤 {card['card_owner']}"
-        )
-
-    else:
-
-        text = (
-            "💳 <b>Karta sozlamalari</b>\n\n"
-            "❌ Hozircha karta qo'shilmagan."
-        )
-
-    await message.answer(
-        text,
-        reply_markup=card_keyboard()
-    )
-
-
-@router.message(
-    F.text.in_({
-        "➕ Karta qo'shish",
-        "🔄 Kartani almashtirish"
-    })
-)
-async def card_start(
-    message: Message,
-    state: FSMContext
-):
-
-    if not is_admin(message.from_user.id):
-        return
-
-    await state.set_state(
-        CardState.number
-    )
-
-    await message.answer(
-        "💳 <b>Karta raqamini yuboring.</b>\n\n"
-        "12–19 ta raqam.\n\n"
-        "Masalan:\n"
-        "<code>9860600435412504</code>",
-        reply_markup=back_keyboard()
-    )
-
-
-@router.message(
-    CardState.number,
-    F.text
-)
-async def card_number(
-    message: Message,
-    state: FSMContext
-):
-
-    number = re.sub(
-        r"\D",
-        "",
-        message.text
-    )
-
-    if not 12 <= len(number) <= 19:
-
-        await message.answer(
-            "❌ Karta raqami noto'g'ri.\n"
-            "12–19 ta raqam yuboring.",
-            reply_markup=back_keyboard()
-        )
-        return
-
-    await state.update_data(
-        card_number=number
-    )
-
-    await state.set_state(
-        CardState.owner
-    )
-
-    await message.answer(
-        "👤 <b>Karta egasining ism-familiyasini yuboring.</b>\n\n"
-        "Masalan: Muhammad Ali.O.",
-        reply_markup=back_keyboard()
-    )
-
-
-@router.message(
-    CardState.owner,
-    F.text
-)
-async def card_owner(
-    message: Message,
-    state: FSMContext
-):
-
-    owner_name = message.text.strip()
-
-    if len(owner_name) < 2:
-
-        await message.answer(
-            "❌ Ism noto'g'ri.",
-            reply_markup=back_keyboard()
-        )
-        return
-
-    data = await state.get_data()
-
-    dbq(
-        """
-        INSERT INTO cards(
-            admin_id,
-            card_number,
-            card_owner,
-            updated_at
-        )
-        VALUES(?,?,?,?)
-
-        ON CONFLICT(admin_id)
-        DO UPDATE SET
-            card_number=excluded.card_number,
-            card_owner=excluded.card_owner,
-            updated_at=excluded.updated_at
-        """,
-        (
-            message.from_user.id,
-            data["card_number"],
-            owner_name,
-            now_iso()
-        ),
-        commit=True
-    )
-
-    await state.clear()
-
-    await message.answer(
-        "✅ <b>Karta muvaffaqiyatli saqlandi.</b>\n\n"
-        "Bu karta faqat sizning admin profilingizga tegishli.",
-        reply_markup=card_keyboard()
-    )
-
-
-@router.message(
-    F.text == "👀 Hozirgi kartani ko'rish"
-)
-async def card_view(message: Message):
-
-    card = dbq(
-        """
-        SELECT *
-        FROM cards
-        WHERE admin_id=?
-        """,
-        (message.from_user.id,),
-        one=True
-    )
-
-    if not card:
-
-        await message.answer(
-            "❌ Karta yo'q.",
-            reply_markup=card_keyboard()
-        )
-        return
-
-    await message.answer(
-        "💳 <b>Sizning kartangiz</b>\n\n"
-        f"💳 <code>{card['card_number']}</code>\n"
-        f"👤 {card['card_owner']}",
-        reply_markup=card_keyboard()
-    )
-
-
-@router.message(
-    F.text == "🗑 Kartani o'chirish"
-)
-async def card_delete(message: Message):
-
-    dbq(
-        "DELETE FROM cards WHERE admin_id=?",
-        (message.from_user.id,),
-        commit=True
-    )
-
-    await message.answer(
-        "🗑 Karta o'chirildi.",
-        reply_markup=card_keyboard()
-    )
-
-
-# =========================================================
-# CHANNEL MANAGEMENT
-# =========================================================
-
-@router.message(F.text == "📢 Kanallar")
-async def channels_menu(
-    message: Message,
-    state: FSMContext
-):
-
-    if not is_admin(message.from_user.id):
-        return
-
-    await state.clear()
-
-    await message.answer(
-        "📢 <b>Kanal sozlamalari</b>",
-        reply_markup=channel_keyboard()
-    )
-
-
-@router.message(F.text == "📋 Kanallar")
-async def channels_list(message: Message):
-
-    channels = dbq(
-        "SELECT * FROM channels ORDER BY id",
-        all=True
-    )
-
-    if not channels:
-
-        await message.answer(
-            "❌ Kanal yo'q.",
-            reply_markup=channel_keyboard()
-        )
-        return
-
-    text = "📢 <b>Majburiy kanallar:</b>\n\n"
-
-    for ch in channels:
-        text += (
-            f"🆔 {ch['id']} — "
-            f"{ch['username']}\n"
-        )
-
-    await message.answer(
-        text,
-        reply_markup=channel_keyboard()
-    )
-
-
-@router.message(F.text == "➕ Kanal qo'shish")
-async def channel_add(
-    message: Message,
-    state: FSMContext
-):
-
-    if not is_admin(message.from_user.id):
-        return
-
-    await state.set_state(
-        ChannelAddState.username
-    )
-
-    await message.answer(
-        "📢 <b>Kanal username yoki havolasini yuboring.</b>\n\n"
-        "Masalan:\n"
-        "<code>@uz_kinocinema</code>",
-        reply_markup=back_keyboard()
-    )
-
-
-@router.message(
-    ChannelAddState.username,
-    F.text
-)
-async def channel_add_save(
-    message: Message,
-    state: FSMContext
-):
-
-    username = normalize_channel(
-        message.text
-    )
-
-    try:
-
-        chat = await bot.get_chat(
-            username
-        )
-
-        await bot.get_chat_member(
-            username,
-            message.from_user.id
-        )
-
-        dbq(
-            """
-            INSERT OR IGNORE INTO channels(
-                username,
-                title
+        try:
+            await callback.message.edit_reply_markup(
+                reply_markup=None
             )
-            VALUES(?,?)
-            """,
-            (
-                username,
-                chat.title or username
-            ),
-            commit=True
-        )
+        except Exception:
+            pass
 
-        await state.clear()
+        try:
+            await bot.send_message(
+                payment["user_id"],
+                "❌ To'lov bekor qilindi.\n\n"
+                "Prime ochilmadi.",
+            )
 
-        await message.answer(
-            "✅ <b>Kanal qo'shildi.</b>",
-            reply_markup=channel_keyboard()
-        )
-
-    except Exception:
-
-        await message.answer(
-            "❌ Kanal topilmadi yoki bot "
-            "kanalda administrator emas.",
-            reply_markup=back_keyboard()
-        )
+        except Exception:
+            logger.exception(
+                "Rejected payment userga yuborilmadi"
+            )
 
 
-@router.message(F.text == "🗑 Kanal o'chirish")
-async def channel_delete(
-    message: Message,
-    state: FSMContext
-):
-
-    if not is_admin(message.from_user.id):
-        return
-
-    await state.set_state(
-        ChannelDeleteState.username
-    )
-
-    await message.answer(
-        "🗑 <b>O'chiriladigan kanal usernameini yuboring.</b>\n\n"
-        "Masalan: <code>@uz_kinocinema</code>",
-        reply_markup=back_keyboard()
-    )
-
+# ============================================================
+# USER MOVIE LIST
+# ============================================================
 
 @router.message(
-    ChannelDeleteState.username,
-    F.text
+    F.text == "📚 Kinolar ro'yxati"
 )
-async def channel_delete_save(
+async def movie_list_user(
     message: Message,
-    state: FSMContext
 ):
-
-    username = normalize_channel(
-        message.text
-    )
-
-    dbq(
-        "DELETE FROM channels WHERE username=?",
-        (username,),
-        commit=True
-    )
-
-    await state.clear()
-
-    await message.answer(
-        "🗑 <b>Kanal o'chirildi.</b>",
-        reply_markup=channel_keyboard()
-    )
-
-
-# =========================================================
-# ADMIN MANAGEMENT
-# FAQAT OWNER
-# =========================================================
-
-@router.message(F.text == "👥 Adminlar")
-async def admins_menu(message: Message):
-
-    if not is_owner(message.from_user.id):
-        return
-
-    await message.answer(
-        "👥 <b>Adminlar</b>",
-        reply_markup=keyboard([
-            ["➕ Admin qo'shish", "🗑 Admin o'chirish"],
-            ["📋 Adminlar"],
-            ["⬅️ Admin panel"]
-        ])
-    )
-
-
-@router.message(F.text == "➕ Admin qo'shish")
-async def admin_add(
-    message: Message,
-    state: FSMContext
-):
-
-    if not is_owner(message.from_user.id):
-        return
-
-    await state.set_state(
-        AdminAddState.user_id
-    )
-
-    await message.answer(
-        "👤 <b>Admin qilinadigan odamning Telegram ID sini yuboring.</b>\n\n"
-        "U odam avval botga /start bergan bo'lishi kerak.",
-        reply_markup=back_keyboard()
-    )
-
-
-@router.message(
-    AdminAddState.user_id,
-    F.text
-)
-async def admin_add_save(
-    message: Message,
-    state: FSMContext
-):
-
-    if not is_owner(message.from_user.id):
-        return
-
-    try:
-        user_id = int(
-            message.text.strip()
-        )
-    except Exception:
-
-        await message.answer(
-            "❌ Telegram ID noto'g'ri.",
-            reply_markup=back_keyboard()
-        )
-        return
-
-    user = get_user(user_id)
-
-    if not user:
-
-        await message.answer(
-            "❌ Bu foydalanuvchi hali botga "
-            "/start bermagan.",
-            reply_markup=back_keyboard()
-        )
-        return
-
-    dbq(
-        """
-        INSERT OR REPLACE INTO admins(
-            user_id,
-            username,
-            added_by,
-            created_at
-        )
-        VALUES(?,?,?,?)
-        """,
-        (
-            user_id,
-            user["username"] or "",
-            message.from_user.id,
-            now_iso()
-        ),
-        commit=True
-    )
-
-    await state.clear()
-
-    await message.answer(
-        "✅ <b>Admin qo'shildi.</b>",
-        reply_markup=admin_keyboard()
-    )
-
-
-@router.message(F.text == "🗑 Admin o'chirish")
-async def admin_delete(
-    message: Message,
-    state: FSMContext
-):
-
-    if not is_owner(message.from_user.id):
-        return
-
-    await state.set_state(
-        AdminDeleteState.user_id
-    )
-
-    await message.answer(
-        "🗑 Adminning Telegram ID sini yuboring.",
-        reply_markup=back_keyboard()
-    )
-
-
-@router.message(
-    AdminDeleteState.user_id,
-    F.text
-)
-async def admin_delete_save(
-    message: Message,
-    state: FSMContext
-):
-
-    if not is_owner(message.from_user.id):
-        return
-
-    try:
-        user_id = int(
-            message.text.strip()
-        )
-    except Exception:
-
-        await message.answer(
-            "❌ ID noto'g'ri.",
-            reply_markup=back_keyboard()
-        )
-        return
-
-    dbq(
-        "DELETE FROM admins WHERE user_id=?",
-        (user_id,),
-        commit=True
-    )
-
-    await state.clear()
-
-    await message.answer(
-        "🗑 <b>Admin o'chirildi.</b>",
-        reply_markup=admin_keyboard()
-    )
-
-
-@router.message(F.text == "📋 Adminlar")
-async def admin_list(message: Message):
-
-    if not is_owner(message.from_user.id):
-        return
-
-    admins = dbq(
-        "SELECT * FROM admins ORDER BY created_at",
-        all=True
-    )
-
-    if not admins:
-
-        await message.answer(
-            "👥 Hozircha boshqa admin yo'q."
-        )
-        return
-
-    text = "👥 <b>Adminlar:</b>\n\n"
-
-    for a in admins:
-
-        username = (
-            "@"
-            + a["username"]
-            if a["username"]
-            else "username yo'q"
-        )
-
-        text += (
-            f"👤 {username}\n"
-            f"🆔 <code>{a['user_id']}</code>\n\n"
-        )
-
-    await message.answer(text)
-
-
-# =========================================================
-# REFERRAL
-# =========================================================
-
-@router.message(F.text == "🔗 Mening referralim")
-async def my_referral(message: Message):
-
-    if not is_admin(message.from_user.id):
-        return
-
-    link = await create_start_link(
-        bot,
-        f"ref_{message.from_user.id}",
-        encode=False
-    )
-
-    users_count = dbq(
-        """
-        SELECT COUNT(*) AS c
-        FROM referrals
-        WHERE admin_id=?
-        """,
-        (message.from_user.id,),
-        one=True
-    )["c"]
-
-    income = dbq(
-        """
-        SELECT COALESCE(SUM(price),0) AS s
-        FROM payments
-        WHERE admin_id=?
-        AND status='approved'
-        """,
-        (message.from_user.id,),
-        one=True
-    )["s"]
-
-    await message.answer(
-        "🔗 <b>Sizning referral linkingiz</b>\n\n"
-        f"<code>{link}</code>\n\n"
-        f"👥 Silka orqali kirganlar: "
-        f"<b>{users_count}</b>\n"
-        f"💰 Tasdiqlangan tushum: "
-        f"<b>{money(income)} so'm</b>"
-    )
-
-
-# =========================================================
-# STATISTIKA
-# =========================================================
-
-@router.message(F.text == "📊 Statistika")
-async def statistics(message: Message):
-
-    if not is_admin(message.from_user.id):
-        return
-
-    users = dbq(
-        "SELECT COUNT(*) AS c FROM users",
-        one=True
-    )["c"]
-
-    movies = dbq(
-        "SELECT COUNT(*) AS c FROM movies",
-        one=True
-    )["c"]
-
-    referrals = dbq(
-        """
-        SELECT COUNT(*) AS c
-        FROM referrals
-        WHERE admin_id=?
-        """,
-        (message.from_user.id,),
-        one=True
-    )["c"]
-
-    income = dbq(
-        """
-        SELECT COALESCE(SUM(price),0) AS s
-        FROM payments
-        WHERE admin_id=?
-        AND status='approved'
-        """,
-        (message.from_user.id,),
-        one=True
-    )["s"]
-
-    await message.answer(
-        "📊 <b>Statistika</b>\n\n"
-        f"👥 Umumiy foydalanuvchilar: "
-        f"<b>{users}</b>\n"
-        f"🎬 Kinolar: <b>{movies}</b>\n"
-        f"🔗 Sizning referral foydalanuvchilaringiz: "
-        f"<b>{referrals}</b>\n"
-        f"💰 Sizning tushumingiz: "
-        f"<b>{money(income)} so'm</b>"
-    )
-
-
-# =========================================================
-# ADD MOVIE
-# =========================================================
-
-@router.message(F.text == "🎬 Kino qo'shish")
-async def movie_add_start(
-    message: Message,
-    state: FSMContext
-):
-
-    if not is_admin(message.from_user.id):
-        return
-
-    await state.set_state(
-        MovieAddState.code
-    )
-
-    await message.answer(
-        "🎬 <b>Kino qo'shish — 1/4</b>\n\n"
-        "Kino kodini yuboring.\n"
-        "Masalan: <code>247</code>",
-        reply_markup=back_keyboard()
-    )
-
-
-@router.message(
-    MovieAddState.code,
-    F.text
-)
-async def movie_add_code(
-    message: Message,
-    state: FSMContext
-):
-
-    code = message.text.strip()
-
-    if not re.fullmatch(
-        r"[A-Za-z0-9_-]{1,30}",
-        code
-    ):
-
-        await message.answer(
-            "❌ Kod noto'g'ri.",
-            reply_markup=back_keyboard()
-        )
-        return
-
-    exists = dbq(
-        """
-        SELECT 1
-        FROM movies
-        WHERE lower(code)=lower(?)
-        """,
-        (code,),
-        one=True
-    )
-
-    if exists:
-
-        await message.answer(
-            "❌ Bu kod allaqachon mavjud.",
-            reply_markup=back_keyboard()
-        )
-        return
-
-    await state.update_data(
-        code=code
-    )
-
-    await state.set_state(
-        MovieAddState.title
-    )
-
-    await message.answer(
-        "🎬 <b>Kino nomini yuboring.</b>",
-        reply_markup=back_keyboard()
-    )
-
-
-@router.message(
-    MovieAddState.title,
-    F.text
-)
-async def movie_add_title(
-    message: Message,
-    state: FSMContext
-):
-
-    title = message.text.strip()
-
-    if not title:
-
-        await message.answer(
-            "❌ Kino nomini yuboring.",
-            reply_markup=back_keyboard()
-        )
-        return
-
-    await state.update_data(
-        title=title
-    )
-
-    await state.set_state(
-        MovieAddState.video
-    )
-
-    await message.answer(
-        "🎥 <b>Kino videosini yuboring.</b>",
-        reply_markup=back_keyboard()
-    )
-
-
-@router.message(
-    MovieAddState.video,
-    F.video
-)
-async def movie_add_video(
-    message: Message,
-    state: FSMContext
-):
-
-    await state.update_data(
-        file_id=message.video.file_id
-    )
-
-    await state.set_state(
-        MovieAddState.kind
-    )
-
-    await message.answer(
-        "🔐 <b>Kino turini tanlang:</b>",
-        reply_markup=keyboard([
-            ["🆓 Oddiy kino", "⭐ Faqat Prime"],
-            ["❌ Bekor qilish"]
-        ])
-    )
-
-
-@router.message(
-    MovieAddState.video
-)
-async def movie_add_wrong_video(
-    message: Message
-):
-
-    await message.answer(
-        "❌ Iltimos, kinoni <b>video</b> sifatida yuboring.",
-        reply_markup=back_keyboard()
-    )
-
-
-@router.message(
-    MovieAddState.kind,
-    F.text.in_({
-        "🆓 Oddiy kino",
-        "⭐ Faqat Prime"
-    })
-)
-async def movie_add_finish(
-    message: Message,
-    state: FSMContext
-):
-
-    data = await state.get_data()
-
-    prime_only = (
-        1
-        if message.text == "⭐ Faqat Prime"
-        else 0
-    )
-
-    dbq(
-        """
-        INSERT INTO movies(
-            code,
-            title,
-            file_id,
-            prime_only,
-            views,
-            added_by,
-            created_at
-        )
-        VALUES(?,?,?,?,?,?,?)
-        """,
-        (
-            data["code"],
-            data["title"],
-            data["file_id"],
-            prime_only,
-            0,
-            message.from_user.id,
-            now_iso()
-        ),
-        commit=True
-    )
-
-    await state.clear()
-
-    await message.answer(
-        "✅ <b>Kino qo'shildi!</b>\n\n"
-        f"🔢 Kod: <code>{data['code']}</code>\n"
-        f"🎬 Nomi: <b>{data['title']}</b>\n"
-        f"🔐 Turi: "
-        f"{'⭐ Prime' if prime_only else '🆓 Oddiy'}",
-        reply_markup=admin_keyboard()
-    )
-
-
-# =========================================================
-# DELETE MOVIE
-# =========================================================
-
-@router.message(F.text == "🗑 Kino o'chirish")
-async def movie_delete_start(
-    message: Message,
-    state: FSMContext
-):
-
-    if not is_admin(message.from_user.id):
-        return
-
-    await state.set_state(
-        MovieDeleteState.code
-    )
-
-    await message.answer(
-        "🗑 <b>Kino o'chirish</b>\n\n"
-        "Kino kodini yuboring.",
-        reply_markup=back_keyboard()
-    )
-
-
-@router.message(
-    MovieDeleteState.code,
-    F.text
-)
-async def movie_delete_finish(
-    message: Message,
-    state: FSMContext
-):
-
-    code = message.text.strip()
-
-    movie = dbq(
+    rows = db.execute(
         """
         SELECT *
-        FROM movies
-        WHERE lower(code)=lower(?)
-        """,
-        (code,),
-        one=True
-    )
-
-    if not movie:
-
-        await message.answer(
-            "❌ Bunday kino topilmadi.",
-            reply_markup=back_keyboard()
-        )
-        return
-
-    dbq(
-        "DELETE FROM movies WHERE id=?",
-        (movie["id"],),
-        commit=True
-    )
-
-    await state.clear()
-
-    await message.answer(
-        f"🗑 <b>{movie['title']}</b> o'chirildi.",
-        reply_markup=admin_keyboard()
-    )
-
-
-# =========================================================
-# ADMIN MOVIES
-# =========================================================
-
-@router.message(F.text == "📚 Kinolar")
-async def admin_movies(message: Message):
-
-    if not is_admin(message.from_user.id):
-        return
-
-    movies = dbq(
-        """
-        SELECT code,title,views,prime_only
         FROM movies
         ORDER BY id DESC
-        """,
-        all=True
-    )
+        """
+    ).fetchall()
 
-    if not movies:
-
+    if not rows:
         await message.answer(
-            "📚 Kino yo'q.",
-            reply_markup=admin_keyboard()
+            "📚 Hozircha kinolar mavjud emas."
         )
+
         return
 
-    text = "📚 <b>Kinolar</b>\n\n"
+    chunks = []
 
-    for movie in movies:
+    for movie in rows:
 
-        star = "⭐ " if movie["prime_only"] else ""
+        mark = (
+            "⭐ "
+            if movie["prime_only"]
+            else "🎬 "
+        )
 
-        text += (
-            f"{star}<code>{movie['code']}</code> — "
-            f"{movie['title']} | "
-            f"👁 {movie['views']}\n"
+        chunks.append(
+            f"{mark}"
+            f"{escape(movie['title'])}\n"
+            f"🔢 Kod: {escape(movie['code'])} | "
+            f"👁 {movie['views']}"
         )
 
     await message.answer(
-        text,
-        reply_markup=admin_keyboard()
+        "📚 Kinolar ro'yxati\n\n"
+        + "\n\n".join(chunks)
     )
 
 
-# =========================================================
-# KINO BUYURTMA
-# =========================================================
+# ============================================================
+# INSTAGRAM
+# ============================================================
 
-@router.message(F.text == "🎬 Kino buyurtma qilish")
+@router.message(
+    F.text == "📸 Instagramga qaytish"
+)
+async def instagram_handler(
+    message: Message,
+):
+    builder = InlineKeyboardBuilder()
+
+    builder.row(
+        InlineKeyboardButton(
+            text="📸 Instagramga o'tish",
+            url=INSTAGRAM_URL,
+        )
+    )
+
+    await message.answer(
+        "📸 Instagram sahifamiz:",
+        reply_markup=builder.as_markup(),
+    )
+
+
+# ============================================================
+# ORDER
+# ============================================================
+
+@router.message(
+    F.text == "🎬 Kino buyurtma qilish"
+)
 async def order_start(
     message: Message,
-    state: FSMContext
+    state: FSMContext,
 ):
-
     await state.set_state(
         OrderState.text
     )
 
     await message.answer(
-        "🎬 <b>Kino buyurtma qilish</b>\n\n"
-        "Qaysi kino kerakligini yozing:",
-        reply_markup=back_keyboard()
+        "🎬 Qanday kino kerakligini "
+        "yozib yuboring.",
+        reply_markup=back_cancel_keyboard(),
     )
 
 
 @router.message(
     OrderState.text,
-    F.text
+    F.text,
 )
-async def order_finish(
+async def order_handler(
     message: Message,
-    state: FSMContext
+    state: FSMContext,
+    bot: Bot,
 ):
+    text = message.text.strip()
 
-    admin_id = payment_admin(
-        message.from_user.id
+    if not text:
+        await message.answer(
+            "❌ Buyurtma matni bo'sh bo'lmasin."
+        )
+
+        return
+
+    admin_id = (
+        get_referral_admin(
+            message.from_user.id
+        )
+        or SUPERADMIN_ID
     )
 
-    dbq(
+    if not admin_id:
+        await message.answer(
+            "❌ Mas'ul admin aniqlanmadi."
+        )
+
+        await state.clear()
+
+        return
+
+    order_id = db.execute(
         """
         INSERT INTO orders(
             user_id,
@@ -2287,200 +2088,1557 @@ async def order_finish(
         (
             message.from_user.id,
             admin_id,
-            message.text.strip(),
-            now_iso()
+            text,
+            now(),
         ),
-        commit=True
-    )
+    ).lastrowid
 
-    if admin_id:
-
-        try:
-
-            await bot.send_message(
-                admin_id,
-                "🎬 <b>Yangi kino buyurtmasi!</b>\n\n"
-                f"👤 User: "
-                f"<code>{message.from_user.id}</code>\n"
-                f"📝 So'rov: "
-                f"<b>{message.text.strip()}</b>"
-            )
-
-        except Exception:
-            pass
+    db.commit()
 
     await state.clear()
 
     await message.answer(
-        "✅ <b>Buyurtmangiz yuborildi.</b>",
-        reply_markup=main_keyboard(
+        "✅ Buyurtmangiz qabul qilindi.",
+        reply_markup=main_menu(
             message.from_user.id
-        )
+        ),
     )
 
-
-# =========================================================
-# INSTAGRAM / ADS
-# =========================================================
-
-@router.message(F.text == "📸 Instagramga qaytish")
-async def instagram(message: Message):
-
-    await message.answer(
-        "📸 <b>Instagram</b>",
-        reply_markup=InlineKeyboardMarkup(
-            inline_keyboard=[
-                [
-                    InlineKeyboardButton(
-                        text="📸 Instagramga o'tish",
-                        url=INSTAGRAM_URL
-                    )
-                ]
-            ]
+    try:
+        await bot.send_message(
+            admin_id,
+            "🎬 Yangi kino buyurtma!\n\n"
+            f"🧾 Buyurtma ID: {order_id}\n"
+            f"👤 User ID: {message.from_user.id}\n"
+            f"📝 {escape(text)}",
         )
-    )
+
+    except Exception:
+        logger.exception(
+            "Order adminiga yuborilmadi"
+        )
 
 
-@router.message(F.text == "🤝 Reklama & Bot olish")
-async def ads(message: Message):
+# ============================================================
+# ADS
+# ============================================================
 
+@router.message(
+    F.text == "🤝 Reklama & Bot olish"
+)
+async def ads_handler(
+    message: Message,
+):
     await message.answer(
-        "🤝 <b>Reklama & Bot olish</b>\n\n"
+        "🤝 Reklama & Bot olish\n\n"
         "Admin: @omono_v"
     )
 
 
-# =========================================================
-# FALLBACK — KINO KODI
-# =========================================================
+# ============================================================
+# ADMIN PANEL
+# ============================================================
 
-@router.message()
-async def fallback(
+@router.message(
+    F.text == "👨‍💻 Admin panel"
+)
+async def admin_panel_handler(
     message: Message,
-    state: FSMContext
+    state: FSMContext,
 ):
+    await state.clear()
 
-    # Agar biror FSM jarayoni davom etayotgan bo'lsa,
-    # bu handler aralashmaydi.
-    if await state.get_state():
-        return
-
-    text = (message.text or "").strip()
-
-    if not text:
-        return
-
-    movie = dbq(
-        """
-        SELECT *
-        FROM movies
-        WHERE lower(code)=lower(?)
-        """,
-        (text,),
-        one=True
-    )
-
-    if movie:
-
-        if (
-            movie["prime_only"]
-            and not prime_active(
-                message.from_user.id
-            )
-        ):
-
-            await message.answer(
-                "⭐ Bu kino faqat Prime uchun."
-            )
-            return
-
-        dbq(
-            """
-            UPDATE movies
-            SET views=views+1
-            WHERE id=?
-            """,
-            (movie["id"],),
-            commit=True
-        )
-
-        await bot.send_video(
-            message.chat.id,
-            movie["file_id"],
-            caption=(
-                f"🎬 <b>{movie['title']}</b>\n"
-                f"🔢 Kod: <code>{movie['code']}</code>\n\n"
-                "🍿 Yoqimli tomosha!"
-            )
+    if not is_admin(
+        message.from_user.id
+    ):
+        await message.answer(
+            "❌ Sizda admin huquqi yo'q."
         )
 
         return
 
     await message.answer(
-        "❓ <b>Buyruq topilmadi.</b>\n\n"
-        "🔎 Kino qidirish tugmasini bosing "
-        "yoki kino kodini yuboring.",
-        reply_markup=main_keyboard(
+        "👨‍💻 Admin panel",
+        reply_markup=admin_menu(
             message.from_user.id
-        )
+        ),
     )
 
 
-# =========================================================
-# RENDER HEALTH SERVER
-# =========================================================
+# ============================================================
+# HOME
+# ============================================================
 
-async def health(request):
+@router.message(
+    F.text == "🏠 Asosiy menyu"
+)
+async def home_handler(
+    message: Message,
+    state: FSMContext,
+):
+    await state.clear()
+
+    await message.answer(
+        "🏠 Asosiy menyu",
+        reply_markup=main_menu(
+            message.from_user.id
+        ),
+    )
+
+
+# ============================================================
+# ADD MOVIE
+# ============================================================
+
+@router.message(
+    F.text == "🎬 Kino qo'shish"
+)
+async def movie_add_start(
+    message: Message,
+    state: FSMContext,
+):
+    if not is_admin(
+        message.from_user.id
+    ):
+        return
+
+    await state.set_state(
+        MovieAddState.code
+    )
+
+    await message.answer(
+        "🎬 Kino qo'shish — 1/4\n\n"
+        "Kino kodini yuboring.",
+        reply_markup=back_cancel_keyboard(),
+    )
+
+
+@router.message(
+    MovieAddState.code,
+    F.text,
+)
+async def movie_add_code(
+    message: Message,
+    state: FSMContext,
+):
+    code = message.text.strip()
+
+    if not code.isdigit():
+        await message.answer(
+            "❌ Kino kodi faqat raqamlardan "
+            "iborat bo'lishi kerak."
+        )
+
+        return
+
+    if db.execute(
+        "SELECT 1 FROM movies WHERE code=?",
+        (code,),
+    ).fetchone():
+
+        await message.answer(
+            "❌ Bu koddagi kino allaqachon mavjud."
+        )
+
+        return
+
+    await state.update_data(
+        code=code
+    )
+
+    await state.set_state(
+        MovieAddState.title
+    )
+
+    await message.answer(
+        "🎬 Kino qo'shish — 2/4\n\n"
+        "Kino nomini yuboring.",
+        reply_markup=back_cancel_keyboard(),
+    )
+
+
+@router.message(
+    MovieAddState.title,
+    F.text,
+)
+async def movie_add_title(
+    message: Message,
+    state: FSMContext,
+):
+    title = message.text.strip()
+
+    if len(title) < 1:
+        await message.answer(
+            "❌ Kino nomi bo'sh bo'lmasin."
+        )
+
+        return
+
+    await state.update_data(
+        title=title
+    )
+
+    await state.set_state(
+        MovieAddState.video
+    )
+
+    await message.answer(
+        "🎬 Kino qo'shish — 3/4\n\n"
+        "Kino videosini yuboring.",
+        reply_markup=back_cancel_keyboard(),
+    )
+
+
+@router.message(
+    MovieAddState.video,
+    F.video,
+)
+async def movie_add_video(
+    message: Message,
+    state: FSMContext,
+):
+    await state.update_data(
+        file_id=message.video.file_id
+    )
+
+    await state.set_state(
+        MovieAddState.type
+    )
+
+    builder = InlineKeyboardBuilder()
+
+    builder.row(
+        InlineKeyboardButton(
+            text="🆓 Oddiy kino",
+            callback_data="movie_type:0",
+        ),
+        InlineKeyboardButton(
+            text="⭐ Faqat Prime",
+            callback_data="movie_type:1",
+        ),
+    )
+
+    await message.answer(
+        "🎬 Kino qo'shish — 4/4\n\n"
+        "Kino turini tanlang:",
+        reply_markup=builder.as_markup(),
+    )
+
+
+@router.message(
+    MovieAddState.video
+)
+async def movie_add_video_wrong(
+    message: Message,
+):
+    await message.answer(
+        "🎬 Iltimos, kino videosini VIDEO "
+        "ko'rinishida yuboring."
+    )
+
+
+@router.callback_query(
+    MovieAddState.type,
+    F.data.startswith("movie_type:")
+)
+async def movie_add_type(
+    callback: CallbackQuery,
+    state: FSMContext,
+):
+    if not is_admin(
+        callback.from_user.id
+    ):
+        await callback.answer(
+            "❌ Admin huquqi kerak.",
+            show_alert=True,
+        )
+
+        return
+
+    prime_only = (
+        1
+        if callback.data.endswith(":1")
+        else 0
+    )
+
+    data = await state.get_data()
+
+    try:
+        db.execute(
+            """
+            INSERT INTO movies(
+                code,
+                title,
+                file_id,
+                prime_only,
+                views,
+                added_by,
+                created_at
+            )
+            VALUES(?,?,?,?,?,?,?)
+            """,
+            (
+                data["code"],
+                data["title"],
+                data["file_id"],
+                prime_only,
+                0,
+                callback.from_user.id,
+                now(),
+            ),
+        )
+
+        db.commit()
+
+    except sqlite3.IntegrityError:
+
+        await callback.answer(
+            "❌ Bu kino kodi allaqachon mavjud.",
+            show_alert=True,
+        )
+
+        return
+
+    await state.clear()
+
+    await callback.answer(
+        "✅ Kino qo'shildi!"
+    )
+
+    await callback.message.answer(
+        "✅ Kino qo'shildi!\n\n"
+        f"Kod: {escape(data['code'])}\n"
+        f"Nomi: {escape(data['title'])}\n"
+        f"Turi: "
+        f"{'Prime' if prime_only else 'Oddiy'}",
+        reply_markup=admin_menu(
+            callback.from_user.id
+        ),
+    )
+
+
+# ============================================================
+# DELETE MOVIE
+# ============================================================
+
+@router.message(
+    F.text == "🗑 Kino o'chirish"
+)
+async def movie_delete_start(
+    message: Message,
+    state: FSMContext,
+):
+    if not is_admin(
+        message.from_user.id
+    ):
+        return
+
+    await state.set_state(
+        MovieDeleteState.code
+    )
+
+    await message.answer(
+        "🗑 Kino kodini yuboring.",
+        reply_markup=back_cancel_keyboard(),
+    )
+
+
+@router.message(
+    MovieDeleteState.code,
+    F.text,
+)
+async def movie_delete_handler(
+    message: Message,
+    state: FSMContext,
+):
+    code = message.text.strip()
+
+    movie = db.execute(
+        """
+        SELECT *
+        FROM movies
+        WHERE code=?
+        """,
+        (code,),
+    ).fetchone()
+
+    if not movie:
+        await message.answer(
+            "❌ Bunday kino topilmadi."
+        )
+
+        return
+
+    db.execute(
+        "DELETE FROM movies WHERE code=?",
+        (code,),
+    )
+
+    db.commit()
+
+    await state.clear()
+
+    await message.answer(
+        "✅ Kino o'chirildi!\n\n"
+        f"🎬 {escape(movie['title'])}\n"
+        f"🔢 Kod: {escape(code)}",
+        reply_markup=admin_menu(
+            message.from_user.id
+        ),
+    )
+
+
+# ============================================================
+# ADMIN MOVIE LIST
+# ============================================================
+
+@router.message(
+    F.text == "📚 Kinolar"
+)
+async def admin_movie_list(
+    message: Message,
+):
+    if not is_admin(
+        message.from_user.id
+    ):
+        return
+
+    rows = db.execute(
+        """
+        SELECT *
+        FROM movies
+        ORDER BY id DESC
+        """
+    ).fetchall()
+
+    if not rows:
+        await message.answer(
+            "📚 Hozircha kinolar mavjud emas."
+        )
+
+        return
+
+    text = []
+
+    for movie in rows:
+
+        text.append(
+            f"{'⭐' if movie['prime_only'] else '🎬'} "
+            f"{escape(movie['title'])}\n"
+            f"🔢 {escape(movie['code'])} | "
+            f"👁 {movie['views']}"
+        )
+
+    await message.answer(
+        "📚 Kinolar\n\n"
+        + "\n\n".join(text)
+    )
+
+
+# ============================================================
+# CARD SETTINGS
+# ============================================================
+
+@router.message(
+    F.text == "💳 Karta sozlamalari"
+)
+async def card_settings(
+    message: Message,
+    state: FSMContext,
+):
+    if not is_admin(
+        message.from_user.id
+    ):
+        return
+
+    await state.clear()
+
+    await message.answer(
+        "💳 Karta sozlamalari",
+        reply_markup=card_menu(),
+    )
+
+
+@router.message(
+    F.text.in_(
+        {
+            "➕ Karta qo'shish",
+            "🔄 Kartani almashtirish",
+        }
+    )
+)
+async def card_add_start(
+    message: Message,
+    state: FSMContext,
+):
+    if not is_admin(
+        message.from_user.id
+    ):
+        return
+
+    await state.set_state(
+        CardState.number
+    )
+
+    await message.answer(
+        "💳 Karta raqamini yuboring.\n\n"
+        "Masalan:\n"
+        "9860600435412504",
+        reply_markup=back_cancel_keyboard(),
+    )
+
+
+@router.message(
+    CardState.number,
+    F.text,
+)
+async def card_number_handler(
+    message: Message,
+    state: FSMContext,
+):
+    number = "".join(
+        message.text.split()
+    )
+
+    if (
+        not number.isdigit()
+        or not 12 <= len(number) <= 19
+    ):
+        await message.answer(
+            "❌ Karta raqami 12–19 ta "
+            "raqamdan iborat bo'lishi kerak."
+        )
+
+        return
+
+    await state.update_data(
+        card_number=number
+    )
+
+    await state.set_state(
+        CardState.owner
+    )
+
+    await message.answer(
+        "2/2:\n\n"
+        "👤 Karta egasining ism-familiyasini "
+        "yuboring.\n\n"
+        "Masalan:\n"
+        "Muhammad Ali.O.",
+        reply_markup=back_cancel_keyboard(),
+    )
+
+
+@router.message(
+    CardState.owner,
+    F.text,
+)
+async def card_owner_handler(
+    message: Message,
+    state: FSMContext,
+):
+    owner = message.text.strip()
+
+    if len(owner) < 2:
+        await message.answer(
+            "❌ Ism-familiya juda qisqa."
+        )
+
+        return
+
+    data = await state.get_data()
+
+    save_card(
+        message.from_user.id,
+        data["card_number"],
+        owner,
+    )
+
+    await state.clear()
+
+    await message.answer(
+        "✅ Karta muvaffaqiyatli saqlandi.",
+        reply_markup=card_menu(),
+    )
+
+
+# ============================================================
+# VIEW CARD
+# ============================================================
+
+@router.message(
+    F.text == "👀 Hozirgi kartani ko'rish"
+)
+async def card_view(
+    message: Message,
+):
+    if not is_admin(
+        message.from_user.id
+    ):
+        return
+
+    card = get_admin_card(
+        message.from_user.id
+    )
+
+    if not card:
+        await message.answer(
+            "❌ Sizda hali karta saqlanmagan."
+        )
+
+        return
+
+    await message.answer(
+        "💳 Hozirgi karta\n\n"
+        f"💳 Raqam: {escape(card['card_number'])}\n"
+        f"👤 Egasi: {escape(card['card_owner'])}\n"
+        f"🕒 Yangilangan: {card['updated_at']}"
+    )
+
+
+# ============================================================
+# DELETE CARD
+# ============================================================
+
+@router.message(
+    F.text == "🗑 Kartani o'chirish"
+)
+async def card_delete(
+    message: Message,
+):
+    if not is_admin(
+        message.from_user.id
+    ):
+        return
+
+    if not get_admin_card(
+        message.from_user.id
+    ):
+        await message.answer(
+            "❌ O'chirish uchun karta topilmadi.",
+            reply_markup=card_menu(),
+        )
+
+        return
+
+    delete_card(
+        message.from_user.id
+    )
+
+    await message.answer(
+        "✅ Karta o'chirildi.",
+        reply_markup=card_menu(),
+    )
+
+
+# ============================================================
+# BACK TO ADMIN PANEL
+# ============================================================
+
+@router.message(
+    F.text == "⬅️ Admin panel"
+)
+async def back_admin_panel(
+    message: Message,
+    state: FSMContext,
+):
+    await state.clear()
+
+    if is_admin(
+        message.from_user.id
+    ):
+        await message.answer(
+            "👨‍💻 Admin panel",
+            reply_markup=admin_menu(
+                message.from_user.id
+            ),
+        )
+
+    else:
+        await message.answer(
+            "🏠 Asosiy menyu",
+            reply_markup=main_menu(
+                message.from_user.id
+            ),
+        )
+
+
+# ============================================================
+# STATISTICS
+# ============================================================
+
+@router.message(
+    F.text == "📊 Statistika"
+)
+async def stats_handler(
+    message: Message,
+):
+    if not is_admin(
+        message.from_user.id
+    ):
+        return
+
+    (
+        referrals,
+        revenue,
+        approved,
+        pending,
+    ) = admin_stats(
+        message.from_user.id
+    )
+
+    text = (
+        "📊 Statistika\n\n"
+        f"👥 Sizning referral orqali kirganlar: "
+        f"{referrals}\n"
+        f"💰 Tasdiqlangan Prime tushumi: "
+        f"{revenue:,} so'm\n"
+        f"📦 Tasdiqlangan to'lovlar: "
+        f"{approved}\n"
+        f"📦 Kutilayotgan to'lovlar: "
+        f"{pending}"
+    )
+
+    # Bosh admin uchun umumiy statistika.
+    if is_superadmin(
+        message.from_user.id
+    ):
+        users = db.execute(
+            """
+            SELECT COUNT(*) AS c
+            FROM users
+            """
+        ).fetchone()["c"]
+
+        movies = db.execute(
+            """
+            SELECT COUNT(*) AS c
+            FROM movies
+            """
+        ).fetchone()["c"]
+
+        primes = db.execute(
+            """
+            SELECT COUNT(*) AS c
+            FROM users
+            WHERE prime_until IS NOT NULL
+              AND prime_until > ?
+            """,
+            (now(),),
+        ).fetchone()["c"]
+
+        total = db.execute(
+            """
+            SELECT COALESCE(SUM(price),0) AS s
+            FROM payments
+            WHERE status='approved'
+            """
+        ).fetchone()["s"]
+
+        admins = db.execute(
+            """
+            SELECT COUNT(*) AS c
+            FROM admins
+            """
+        ).fetchone()["c"]
+
+        text += (
+            "\n\n"
+            "🌐 Umumiy statistika\n\n"
+            f"👥 Umumiy foydalanuvchilar: "
+            f"{users}\n"
+            f"🎬 Kinolar: {movies}\n"
+            f"⭐ Prime userlar: {primes}\n"
+            f"💰 Umumiy tushum: "
+            f"{total:,} so'm\n"
+            f"👥 Adminlar: {admins}"
+        )
+
+    await message.answer(
+        text
+    )
+
+
+# ============================================================
+# REFERRAL
+# ============================================================
+
+@router.message(
+    F.text == "🔗 Mening referralim"
+)
+async def referral_handler(
+    message: Message,
+    bot: Bot,
+):
+    if not is_admin(
+        message.from_user.id
+    ):
+        return
+
+    me = await bot.get_me()
+
+    username = (
+        me.username
+        or BOT_USERNAME
+    )
+
+    link = (
+        f"https://t.me/{username}"
+        f"?start=ref_{message.from_user.id}"
+    )
+
+    count = db.execute(
+        """
+        SELECT COUNT(*) AS c
+        FROM referrals
+        WHERE admin_id=?
+        """,
+        (message.from_user.id,),
+    ).fetchone()["c"]
+
+    revenue = db.execute(
+        """
+        SELECT COALESCE(SUM(price),0) AS s
+        FROM payments
+        WHERE admin_id=?
+          AND status='approved'
+        """,
+        (message.from_user.id,),
+    ).fetchone()["s"]
+
+    await message.answer(
+        "🔗 Sizning referral linkingiz:\n\n"
+        f"{link}\n\n"
+        f"👥 Silka orqali kirganlar: {count}\n"
+        f"💰 Tasdiqlangan tushum: "
+        f"{revenue:,} so'm"
+    )
+
+
+# ============================================================
+# ADMINS MENU
+# ============================================================
+
+@router.message(
+    F.text == "👥 Adminlar"
+)
+async def admins_menu_handler(
+    message: Message,
+    state: FSMContext,
+):
+    if not is_superadmin(
+        message.from_user.id
+    ):
+        await message.answer(
+            "❌ Bu bo'lim faqat bosh admin uchun."
+        )
+
+        return
+
+    await state.clear()
+
+    await message.answer(
+        "👥 Adminlar",
+        reply_markup=admin_manage_menu(),
+    )
+
+
+# ============================================================
+# ADD ADMIN
+# ============================================================
+
+@router.message(
+    F.text == "➕ Admin qo'shish"
+)
+async def admin_add_start(
+    message: Message,
+    state: FSMContext,
+):
+    if not is_superadmin(
+        message.from_user.id
+    ):
+        await message.answer(
+            "❌ Faqat @omono_v admin qo'sha oladi."
+        )
+
+        return
+
+    await state.set_state(
+        AdminAddState.user_id
+    )
+
+    await message.answer(
+        "➕ Admin qo'shish\n\n"
+        "Telegram USER ID yuboring.\n"
+        "Foydalanuvchi avval botga "
+        "/start bergan bo'lishi kerak.",
+        reply_markup=back_cancel_keyboard(),
+    )
+
+
+@router.message(
+    AdminAddState.user_id,
+    F.text,
+)
+async def admin_add_handler(
+    message: Message,
+    state: FSMContext,
+):
+    try:
+        user_id = int(
+            message.text.strip()
+        )
+    except ValueError:
+        await message.answer(
+            "❌ USER ID faqat raqam bo'lishi kerak."
+        )
+
+        return
+
+    user = get_user(
+        user_id
+    )
+
+    if not user:
+        await message.answer(
+            "❌ Bu user botga hali /start bermagan."
+        )
+
+        return
+
+    if is_admin(
+        user_id
+    ):
+        await message.answer(
+            "ℹ️ Bu user allaqachon admin."
+        )
+
+        return
+
+    add_admin(
+        user_id,
+        user["username"],
+        message.from_user.id,
+    )
+
+    await state.clear()
+
+    await message.answer(
+        "✅ Admin qo'shildi.",
+        reply_markup=admin_manage_menu(),
+    )
+
+
+# ============================================================
+# DELETE ADMIN
+# ============================================================
+
+@router.message(
+    F.text == "🗑 Admin o'chirish"
+)
+async def admin_delete_start(
+    message: Message,
+    state: FSMContext,
+):
+    if not is_superadmin(
+        message.from_user.id
+    ):
+        await message.answer(
+            "❌ Faqat @omono_v admin o'chira oladi."
+        )
+
+        return
+
+    await state.set_state(
+        AdminDeleteState.user_id
+    )
+
+    await message.answer(
+        "🗑 O'chiriladigan adminning "
+        "Telegram USER ID sini yuboring.",
+        reply_markup=back_cancel_keyboard(),
+    )
+
+
+@router.message(
+    AdminDeleteState.user_id,
+    F.text,
+)
+async def admin_delete_handler(
+    message: Message,
+    state: FSMContext,
+):
+    try:
+        user_id = int(
+            message.text.strip()
+        )
+    except ValueError:
+        await message.answer(
+            "❌ USER ID faqat raqam bo'lishi kerak."
+        )
+
+        return
+
+    if (
+        user_id == message.from_user.id
+        or is_superadmin(user_id)
+    ):
+        await message.answer(
+            "❌ Bosh adminni o'chirib bo'lmaydi."
+        )
+
+        return
+
+    if not is_admin(
+        user_id
+    ):
+        await message.answer(
+            "❌ Bunday admin topilmadi."
+        )
+
+        return
+
+    remove_admin(
+        user_id
+    )
+
+    await state.clear()
+
+    await message.answer(
+        "✅ Admin o'chirildi.",
+        reply_markup=admin_manage_menu(),
+    )
+
+
+# ============================================================
+# ADMIN LIST
+# ============================================================
+
+@router.message(
+    F.text == "📋 Adminlar"
+)
+async def admin_list_handler(
+    message: Message,
+):
+    if not is_superadmin(
+        message.from_user.id
+    ):
+        await message.answer(
+            "❌ Faqat bosh admin ko'ra oladi."
+        )
+
+        return
+
+    rows = db.execute(
+        """
+        SELECT *
+        FROM admins
+        ORDER BY created_at
+        """
+    ).fetchall()
+
+    if not rows:
+        await message.answer(
+            "👥 Adminlar ro'yxati bo'sh."
+        )
+
+        return
+
+    out = []
+
+    for row in rows:
+
+        username = (
+            f"@{escape(row['username'])}"
+            if row["username"]
+            else "username yo'q"
+        )
+
+        label = (
+            " (Bosh admin)"
+            if (
+                SUPERADMIN_ID is not None
+                and row["user_id"]
+                == SUPERADMIN_ID
+            )
+            else ""
+        )
+
+        out.append(
+            f"👤 {username}{label}\n"
+            f"🆔 {row['user_id']}"
+        )
+
+    await message.answer(
+        "👥 Adminlar\n\n"
+        + "\n\n".join(out)
+    )
+
+
+# ============================================================
+# CHANNEL MENU
+# ============================================================
+
+@router.message(
+    F.text == "📢 Kanallar"
+)
+async def channels_menu_handler(
+    message: Message,
+    state: FSMContext,
+):
+    if not is_admin(
+        message.from_user.id
+    ):
+        return
+
+    await state.clear()
+
+    await message.answer(
+        "📢 Kanallar",
+        reply_markup=channel_menu(),
+    )
+
+
+# ============================================================
+# CHANNEL NORMALIZE
+# ============================================================
+
+def normalize_channel(value):
+    value = value.strip()
+
+    if value.startswith(
+        "https://t.me/"
+    ):
+        value = (
+            "@"
+            + value.rstrip("/")
+            .split("/")[-1]
+        )
+
+    elif value.startswith(
+        "http://t.me/"
+    ):
+        value = (
+            "@"
+            + value.rstrip("/")
+            .split("/")[-1]
+        )
+
+    elif not value.startswith("@"):
+        value = "@" + value
+
+    return value
+
+
+# ============================================================
+# ADD CHANNEL
+# ============================================================
+
+@router.message(
+    F.text == "➕ Kanal qo'shish"
+)
+async def channel_add_start(
+    message: Message,
+    state: FSMContext,
+):
+    if not is_admin(
+        message.from_user.id
+    ):
+        return
+
+    await state.set_state(
+        ChannelAddState.username
+    )
+
+    await message.answer(
+        "➕ Kanal qo'shish\n\n"
+        "@username yoki "
+        "https://t.me/username yuboring.",
+        reply_markup=back_cancel_keyboard(),
+    )
+
+
+@router.message(
+    ChannelAddState.username,
+    F.text,
+)
+async def channel_add_handler(
+    message: Message,
+    state: FSMContext,
+    bot: Bot,
+):
+    username = normalize_channel(
+        message.text
+    )
+
+    try:
+        chat = await bot.get_chat(
+            username
+        )
+
+        me = await bot.get_me()
+
+        member = await bot.get_chat_member(
+            chat.id,
+            me.id,
+        )
+
+        if member.status != ChatMemberStatus.ADMINISTRATOR:
+            await message.answer(
+                "❌ Bot bu kanalda administrator emas."
+            )
+
+            return
+
+    except TelegramBadRequest:
+        await message.answer(
+            "❌ Kanal topilmadi."
+        )
+
+        return
+
+    except TelegramForbiddenError:
+        await message.answer(
+            "❌ Bot bu kanalga kira olmaydi."
+        )
+
+        return
+
+    except Exception:
+        logger.exception(
+            "Kanal qo'shishda xato"
+        )
+
+        await message.answer(
+            "❌ Kanalni tekshirishda "
+            "xatolik yuz berdi."
+        )
+
+        return
+
+    try:
+        db.execute(
+            """
+            INSERT INTO channels(
+                username,
+                title
+            )
+            VALUES(?,?)
+            """,
+            (
+                username,
+                chat.title or username,
+            ),
+        )
+
+        db.commit()
+
+    except sqlite3.IntegrityError:
+        await message.answer(
+            "ℹ️ Bu kanal allaqachon mavjud."
+        )
+
+        return
+
+    await state.clear()
+
+    await message.answer(
+        "✅ Kanal qo'shildi.",
+        reply_markup=channel_menu(),
+    )
+
+
+# ============================================================
+# DELETE CHANNEL
+# ============================================================
+
+@router.message(
+    F.text == "🗑 Kanal o'chirish"
+)
+async def channel_delete_start(
+    message: Message,
+    state: FSMContext,
+):
+    if not is_admin(
+        message.from_user.id
+    ):
+        return
+
+    await state.set_state(
+        ChannelDeleteState.username
+    )
+
+    await message.answer(
+        "🗑 Kanal username'sini yuboring.",
+        reply_markup=back_cancel_keyboard(),
+    )
+
+
+@router.message(
+    ChannelDeleteState.username,
+    F.text,
+)
+async def channel_delete_handler(
+    message: Message,
+    state: FSMContext,
+):
+    username = normalize_channel(
+        message.text
+    )
+
+    row = db.execute(
+        """
+        SELECT *
+        FROM channels
+        WHERE username=?
+        """,
+        (username,),
+    ).fetchone()
+
+    if not row:
+        await message.answer(
+            "❌ Bunday kanal topilmadi."
+        )
+
+        return
+
+    db.execute(
+        """
+        DELETE FROM channels
+        WHERE username=?
+        """,
+        (username,),
+    )
+
+    db.commit()
+
+    await state.clear()
+
+    await message.answer(
+        "✅ Kanal o'chirildi.",
+        reply_markup=channel_menu(),
+    )
+
+
+# ============================================================
+# CHANNEL LIST
+# ============================================================
+
+@router.message(
+    F.text == "📋 Kanallar"
+)
+async def channel_list_handler(
+    message: Message,
+):
+    if not is_admin(
+        message.from_user.id
+    ):
+        return
+
+    rows = db.execute(
+        """
+        SELECT *
+        FROM channels
+        ORDER BY id
+        """
+    ).fetchall()
+
+    if not rows:
+        await message.answer(
+            "📢 Majburiy kanallar "
+            "ro'yxati bo'sh."
+        )
+
+        return
+
+    text = []
+
+    for row in rows:
+        text.append(
+            f"📢 {escape(row['username'])}\n"
+            f"📝 {escape(row['title'] or '')}"
+        )
+
+    await message.answer(
+        "📢 Kanallar\n\n"
+        + "\n\n".join(text)
+    )
+
+
+# ============================================================
+# NUMERIC MOVIE FALLBACK
+# ============================================================
+
+@router.message(
+    F.text.regexp(r"^\d+$")
+)
+async def numeric_movie_fallback(
+    message: Message,
+    state: FSMContext,
+    bot: Bot,
+):
+    # FSM state mavjud bo'lsa fallback ishlamaydi.
+    if await state.get_state():
+        return
+
+    found = await send_movie_by_code(
+        message,
+        message.text.strip(),
+        bot,
+    )
+
+    if found:
+        return
+
+    await message.answer(
+        "❌ Bunday kino topilmadi."
+    )
+
+
+# ============================================================
+# FINAL FALLBACK
+# ============================================================
+
+@router.message()
+async def final_fallback(
+    message: Message,
+    state: FSMContext,
+):
+    # Eng muhim routing himoyasi.
+    # FSM ichidagi xabarlar umumiy fallbackga tushmaydi.
+    if await state.get_state():
+        return
+
+    await message.answer(
+        "❌ Buyruq yoki kino topilmadi.\n\n"
+        "Kerakli bo'limni menyudan tanlang.",
+        reply_markup=main_menu(
+            message.from_user.id
+        ),
+    )
+
+
+# ============================================================
+# RENDER HEALTH SERVER
+# ============================================================
+
+async def health_handler(
+    request,
+):
     return web.Response(
         text="KinoCinema OK"
     )
 
 
 async def start_web_server():
-
     app = web.Application()
 
     app.router.add_get(
         "/",
-        health
+        health_handler,
     )
 
-    app.router.add_get(
-        "/health",
-        health
+    runner = web.AppRunner(
+        app
     )
-
-    runner = web.AppRunner(app)
 
     await runner.setup()
 
     site = web.TCPSite(
         runner,
         "0.0.0.0",
-        int(os.getenv("PORT", "10000"))
+        PORT,
     )
 
     await site.start()
 
+    logger.info(
+        "Health server %s-portda ishga tushdi",
+        PORT,
+    )
+
     return runner
 
 
-# =========================================================
-# START BOT
-# =========================================================
+# ============================================================
+# MAIN
+# ============================================================
 
 async def main():
+    global SUPERADMIN_ID
+    global BOT_USERNAME
 
-    await bot.delete_webhook(
-        drop_pending_updates=True
+    init_db()
+
+    bot = Bot(
+        token=TOKEN,
+        default=DefaultBotProperties(
+            parse_mode=ParseMode.HTML
+        ),
     )
 
-    await start_web_server()
+    try:
+        me = await bot.get_me()
 
-    print("KinoCinema bot ishga tushdi.")
+        if me.username:
+            BOT_USERNAME = me.username
 
-    await dp.start_polling(bot)
+        # Database'dan @omono_v ni topish.
+        row = db.execute(
+            """
+            SELECT user_id
+            FROM users
+            WHERE lower(username)=?
+            """,
+            (
+                SUPERADMIN_USERNAME.lower(),
+            ),
+        ).fetchone()
 
+        if row:
+            SUPERADMIN_ID = row["user_id"]
+
+            add_admin(
+                SUPERADMIN_ID,
+                SUPERADMIN_USERNAME,
+                SUPERADMIN_ID,
+            )
+
+        else:
+            logger.warning(
+                "@%s hali botga /start bermagan. "
+                "Superadmin ID /start dan keyin aniqlanadi.",
+                SUPERADMIN_USERNAME,
+            )
+
+        dp = Dispatcher()
+
+        dp.include_router(
+            router
+        )
+
+        runner = await start_web_server()
+
+        try:
+            await dp.start_polling(
+                bot
+            )
+
+        finally:
+            await runner.cleanup()
+
+    finally:
+        await bot.session.close()
+
+        try:
+            db.close()
+        except Exception:
+            pass
+
+
+# ============================================================
+# RUN
+# ============================================================
 
 if __name__ == "__main__":
     asyncio.run(main())
