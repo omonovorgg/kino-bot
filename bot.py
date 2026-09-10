@@ -730,6 +730,8 @@ async def payment_photo(message: Message, state: FSMContext, bot: Bot):
         await message.answer("❌ To'lov ma'lumotlari topilmadi.", reply_markup=main_menu())
         return
     photo_id = message.photo[-1].file_id
+    # Payment yaratilishidan oldin user yozuvi mavjudligini kafolatlaymiz.
+    upsert_user(message.from_user)
     payment_id = DB.execute("INSERT INTO payments(user_id,admin_id,plan,days,price,status,screenshot_file_id,created_at) VALUES(?,?,?,?,?,?,?,?)", (message.from_user.id, admin_id, data["plan"], data["days"], data["price"], "pending", photo_id, now())).lastrowid
     DB.commit()
     await state.clear()
@@ -1045,8 +1047,21 @@ async def payment_decision(callback: CallbackQuery, bot: Bot):
         await callback.answer("❌ Bu to'lov sizga biriktirilmagan.", show_alert=True); return
     if payment["status"] != "pending": await callback.answer("ℹ️ Bu to'lov allaqachon ko'rib chiqilgan.", show_alert=True); return
     if action == "approve":
+        # Payment jadvalidagi user_id asosiy manba. Ba'zan users yozuvi
+        # eski DB/import/restart sabab yo'qolgan bo'lishi mumkin. Bunday
+        # holatda to'lovni bekor qilmaymiz: userni minimal ma'lumot bilan
+        # qayta yaratib, Prime'ni faollashtiramiz.
         user = get_user(payment["user_id"])
-        if not user: await callback.answer("❌ User topilmadi.", show_alert=True); return
+        if not user:
+            DB.execute(
+                "INSERT OR IGNORE INTO users(user_id, username, first_name, created_at) VALUES(?, ?, ?, ?)",
+                (payment["user_id"], "", "", now())
+            )
+            DB.commit()
+            user = get_user(payment["user_id"])
+        if not user:
+            await callback.answer("❌ User ma'lumotini tiklab bo'lmadi.", show_alert=True)
+            return
         if payment["days"] == 0:
             until = "9999-12-31 23:59:59"
         else:
