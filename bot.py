@@ -4,7 +4,7 @@ import asyncio
 import logging
 import psycopg2
 from psycopg2.extras import RealDictCursor
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from html import escape
 
 from aiohttp import web
@@ -44,47 +44,110 @@ if not DATABASE_URL:
     raise RuntimeError("DATABASE_URL Environment Variable topilmadi. Neon/PostgreSQL ulanish URL sini Render Environment Variables ga qo\'ying.")
 
 class Database:
+    """Small PostgreSQL wrapper with automatic rollback/reconnect safety."""
     def __init__(self, url):
-        self.conn = psycopg2.connect(url, cursor_factory=RealDictCursor, sslmode="require")
+        self.url = url
+        self.conn = None
+        self._connect()
+
+    def _connect(self):
+        if self.conn is not None:
+            try:
+                self.conn.close()
+            except Exception:
+                pass
+        self.conn = psycopg2.connect(
+            self.url,
+            cursor_factory=RealDictCursor,
+            sslmode="require",
+            connect_timeout=15,
+            keepalives=1,
+            keepalives_idle=30,
+            keepalives_interval=10,
+            keepalives_count=3,
+        )
 
     def execute(self, sql, params=()):
         sql = sql.replace("?", "%s")
-        cur = self.conn.cursor()
-        cur.execute(sql, params)
-        return cur
+        try:
+            cur = self.conn.cursor()
+            cur.execute(sql, params)
+            return cur
+        except (psycopg2.InterfaceError, psycopg2.OperationalError):
+            # Neon/Render can drop an idle connection. Reconnect once.
+            try:
+                self._connect()
+                cur = self.conn.cursor()
+                cur.execute(sql, params)
+                return cur
+            except psycopg2.Error:
+                try:
+                    self.conn.rollback()
+                except Exception:
+                    pass
+                raise
+        except psycopg2.Error:
+            # PostgreSQL marks the transaction aborted after a SQL error.
+            # Roll it back immediately so the next Telegram update can run.
+            try:
+                self.conn.rollback()
+            except Exception:
+                pass
+            raise
 
     def executescript(self, sql):
-        cur = self.conn.cursor()
-        cur.execute(sql)
-        return cur
+        try:
+            cur = self.conn.cursor()
+            cur.execute(sql)
+            return cur
+        except psycopg2.Error:
+            try:
+                self.conn.rollback()
+            except Exception:
+                pass
+            raise
 
     def commit(self):
-        self.conn.commit()
+        try:
+            self.conn.commit()
+        except (psycopg2.InterfaceError, psycopg2.OperationalError):
+            # Do not silently claim a failed commit succeeded. Re-raise.
+            raise
+
+    def rollback(self):
+        try:
+            self.conn.rollback()
+        except Exception:
+            pass
 
     def close(self):
-        self.conn.close()
+        try:
+            self.conn.close()
+        except Exception:
+            pass
+
 
 DB = Database(DATABASE_URL)
 
 
 def now():
-    return datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+    return datetime.now(timezone.utc).replace(tzinfo=None).strftime("%Y-%m-%d %H:%M:%S")
 
 
 def init_db():
     DB.executescript("""
     CREATE TABLE IF NOT EXISTS users (
-        user_id INTEGER PRIMARY KEY,
+        user_id BIGINT PRIMARY KEY,
         username TEXT,
         first_name TEXT,
         prime_until TEXT,
-        referred_by INTEGER,
+        referred_by BIGINT,
         created_at TEXT NOT NULL
     );
     CREATE TABLE IF NOT EXISTS admins (
-        user_id INTEGER PRIMARY KEY,
+        user_id BIGINT PRIMARY KEY,
         username TEXT,
-        added_by INTEGER,
+        added_by BIGINT,
         created_at TEXT NOT NULL
     );
     CREATE TABLE IF NOT EXISTS channels (
@@ -93,7 +156,7 @@ def init_db():
         title TEXT
     );
     CREATE TABLE IF NOT EXISTS cards (
-        admin_id INTEGER PRIMARY KEY,
+        admin_id BIGINT PRIMARY KEY,
         card_number TEXT NOT NULL,
         card_owner TEXT NOT NULL,
         updated_at TEXT NOT NULL
@@ -105,13 +168,13 @@ def init_db():
         file_id TEXT NOT NULL,
         prime_only INTEGER NOT NULL DEFAULT 0,
         views INTEGER NOT NULL DEFAULT 0,
-        added_by INTEGER,
+        added_by BIGINT,
         created_at TEXT NOT NULL
     );
     CREATE TABLE IF NOT EXISTS payments (
         id SERIAL PRIMARY KEY,
-        user_id INTEGER NOT NULL,
-        admin_id INTEGER NOT NULL,
+        user_id BIGINT NOT NULL,
+        admin_id BIGINT NOT NULL,
         plan TEXT NOT NULL,
         days INTEGER NOT NULL,
         price INTEGER NOT NULL,
@@ -121,18 +184,39 @@ def init_db():
         decided_at TEXT
     );
     CREATE TABLE IF NOT EXISTS referrals (
-        user_id INTEGER PRIMARY KEY,
-        admin_id INTEGER NOT NULL,
+        user_id BIGINT PRIMARY KEY,
+        admin_id BIGINT NOT NULL,
         created_at TEXT NOT NULL
     );
     CREATE TABLE IF NOT EXISTS orders (
         id SERIAL PRIMARY KEY,
-        user_id INTEGER NOT NULL,
-        admin_id INTEGER NOT NULL,
+        user_id BIGINT NOT NULL,
+        admin_id BIGINT NOT NULL,
         text TEXT NOT NULL,
         created_at TEXT NOT NULL
     );
     """)
+
+    # Existing Neon tables may have been created by an earlier version using
+    # PostgreSQL INTEGER. Telegram IDs can exceed INTEGER's 32-bit range, so
+    # migrate every Telegram-ID column to BIGINT. These ALTER statements are
+    # safe to run on every startup and preserve existing rows.
+    telegram_id_columns = [
+        ("users", "user_id"),
+        ("users", "referred_by"),
+        ("admins", "user_id"),
+        ("admins", "added_by"),
+        ("cards", "admin_id"),
+        ("movies", "added_by"),
+        ("payments", "user_id"),
+        ("payments", "admin_id"),
+        ("referrals", "user_id"),
+        ("referrals", "admin_id"),
+        ("orders", "user_id"),
+        ("orders", "admin_id"),
+    ]
+    for table, column in telegram_id_columns:
+        DB.execute(f'ALTER TABLE "{table}" ALTER COLUMN "{column}" TYPE BIGINT')
     DB.execute("INSERT INTO channels(username, title) VALUES(?, ?) ON CONFLICT(username) DO NOTHING", (DEFAULT_CHANNEL, "Uz KinoCinema"))
     DB.commit()
 
@@ -225,7 +309,7 @@ def active_prime(user_id):
     if not row or not row["prime_until"]:
         return False
     try:
-        return datetime.fromisoformat(row["prime_until"]) > datetime.utcnow()
+        return datetime.fromisoformat(row["prime_until"]) > datetime.now(timezone.utc).replace(tzinfo=None)
     except ValueError:
         return False
 
@@ -708,6 +792,7 @@ async def channel_add(message: Message, state: FSMContext, bot: Bot):
         DB.execute("INSERT INTO channels(username,title) VALUES(?,?)", (username, chat.title or username))
         DB.commit()
     except psycopg2.IntegrityError:
+        DB.rollback()
         await message.answer("ℹ️ Bu kanal allaqachon mavjud.")
         return
     await state.clear()
@@ -1090,7 +1175,7 @@ async def payment_decision(callback: CallbackQuery, bot: Bot):
         if payment["days"] == 0:
             until = "9999-12-31 23:59:59"
         else:
-            base = datetime.utcnow()
+            base = datetime.now(timezone.utc).replace(tzinfo=None)
             if user["prime_until"]:
                 try:
                     old = datetime.fromisoformat(user["prime_until"])
