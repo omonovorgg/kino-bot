@@ -2,7 +2,8 @@
 import os
 import asyncio
 import logging
-import sqlite3
+import psycopg2
+from psycopg2.extras import RealDictCursor
 from datetime import datetime, timedelta
 from html import escape
 
@@ -33,16 +34,37 @@ SUPERADMIN_ID = int(SUPERADMIN_ID_ENV) if SUPERADMIN_ID_ENV.isdigit() else None
 DEFAULT_CHANNEL = "@uz_kinocinema"
 INSTAGRAM_URL = "https://www.instagram.com/oemovie/"
 BOT_USERNAME = "kinocinemauz_bot"
-DB_PATH = os.getenv("DB_PATH", "kinocinema.db")
+DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
 PORT = int(os.getenv("PORT", "10000"))
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
 logger = logging.getLogger("KinoCinema")
 
-DB = sqlite3.connect(DB_PATH, check_same_thread=False)
-DB.row_factory = sqlite3.Row
-DB.execute("PRAGMA journal_mode=WAL")
-DB.execute("PRAGMA foreign_keys=ON")
+if not DATABASE_URL:
+    raise RuntimeError("DATABASE_URL Environment Variable topilmadi. Neon/PostgreSQL ulanish URL sini Render Environment Variables ga qo\'ying.")
+
+class Database:
+    def __init__(self, url):
+        self.conn = psycopg2.connect(url, cursor_factory=RealDictCursor, sslmode="require")
+
+    def execute(self, sql, params=()):
+        sql = sql.replace("?", "%s")
+        cur = self.conn.cursor()
+        cur.execute(sql, params)
+        return cur
+
+    def executescript(self, sql):
+        cur = self.conn.cursor()
+        cur.execute(sql)
+        return cur
+
+    def commit(self):
+        self.conn.commit()
+
+    def close(self):
+        self.conn.close()
+
+DB = Database(DATABASE_URL)
 
 
 def now():
@@ -66,7 +88,7 @@ def init_db():
         created_at TEXT NOT NULL
     );
     CREATE TABLE IF NOT EXISTS channels (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        id SERIAL PRIMARY KEY,
         username TEXT UNIQUE NOT NULL,
         title TEXT
     );
@@ -77,7 +99,7 @@ def init_db():
         updated_at TEXT NOT NULL
     );
     CREATE TABLE IF NOT EXISTS movies (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        id SERIAL PRIMARY KEY,
         code TEXT UNIQUE NOT NULL,
         title TEXT NOT NULL,
         file_id TEXT NOT NULL,
@@ -87,7 +109,7 @@ def init_db():
         created_at TEXT NOT NULL
     );
     CREATE TABLE IF NOT EXISTS payments (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        id SERIAL PRIMARY KEY,
         user_id INTEGER NOT NULL,
         admin_id INTEGER NOT NULL,
         plan TEXT NOT NULL,
@@ -104,14 +126,14 @@ def init_db():
         created_at TEXT NOT NULL
     );
     CREATE TABLE IF NOT EXISTS orders (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        id SERIAL PRIMARY KEY,
         user_id INTEGER NOT NULL,
         admin_id INTEGER NOT NULL,
         text TEXT NOT NULL,
         created_at TEXT NOT NULL
     );
     """)
-    DB.execute("INSERT OR IGNORE INTO channels(username, title) VALUES(?, ?)", (DEFAULT_CHANNEL, "Uz KinoCinema"))
+    DB.execute("INSERT INTO channels(username, title) VALUES(?, ?) ON CONFLICT(username) DO NOTHING", (DEFAULT_CHANNEL, "Uz KinoCinema"))
     DB.commit()
 
 
@@ -189,7 +211,7 @@ def get_referral_admin(user_id):
 def set_referral_once(user_id, admin_id):
     if user_id == admin_id or not is_admin_id(admin_id):
         return
-    DB.execute("INSERT OR IGNORE INTO referrals(user_id, admin_id, created_at) VALUES(?, ?, ?)", (user_id, admin_id, now()))
+    DB.execute("INSERT INTO referrals(user_id, admin_id, created_at) VALUES(?, ?, ?) ON CONFLICT(user_id) DO NOTHING", (user_id, admin_id, now()))
     DB.execute("UPDATE users SET referred_by=? WHERE user_id=? AND referred_by IS NULL", (admin_id, user_id))
     DB.commit()
 
@@ -572,7 +594,8 @@ async def movie_add_type(callback: CallbackQuery, state: FSMContext):
     try:
         DB.execute("INSERT INTO movies(code,title,file_id,prime_only,views,added_by,created_at) VALUES(?,?,?,?,?,?,?)", (data["code"], data["title"], data["file_id"], prime_only, 0, callback.from_user.id, now()))
         DB.commit()
-    except sqlite3.IntegrityError:
+    except psycopg2.IntegrityError:
+        DB.conn.rollback()
         await callback.answer("❌ Bu kino kodi allaqachon mavjud.", show_alert=True)
         return
     await state.clear()
@@ -684,7 +707,7 @@ async def channel_add(message: Message, state: FSMContext, bot: Bot):
     try:
         DB.execute("INSERT INTO channels(username,title) VALUES(?,?)", (username, chat.title or username))
         DB.commit()
-    except sqlite3.IntegrityError:
+    except psycopg2.IntegrityError:
         await message.answer("ℹ️ Bu kanal allaqachon mavjud.")
         return
     await state.clear()
@@ -732,7 +755,8 @@ async def payment_photo(message: Message, state: FSMContext, bot: Bot):
     photo_id = message.photo[-1].file_id
     # Payment yaratilishidan oldin user yozuvi mavjudligini kafolatlaymiz.
     upsert_user(message.from_user)
-    payment_id = DB.execute("INSERT INTO payments(user_id,admin_id,plan,days,price,status,screenshot_file_id,created_at) VALUES(?,?,?,?,?,?,?,?)", (message.from_user.id, admin_id, data["plan"], data["days"], data["price"], "pending", photo_id, now())).lastrowid
+    payment_cur = DB.execute("INSERT INTO payments(user_id,admin_id,plan,days,price,status,screenshot_file_id,created_at) VALUES(?,?,?,?,?,?,?,?) RETURNING id", (message.from_user.id, admin_id, data["plan"], data["days"], data["price"], "pending", photo_id, now()))
+    payment_id = payment_cur.fetchone()["id"]
     DB.commit()
     await state.clear()
     caption = f"🧾 Yangi PRIME to'lov!\n\n👤 User: {message.from_user.id}\n📦 Plan: {escape(data['plan'])}\n📅 Muddat: {'Umrbod' if data['days']==0 else str(data['days'])+' kun'}\n💰 Narx: {data['price']:,} so'm"
@@ -757,7 +781,8 @@ async def order_text(message: Message, state: FSMContext, bot: Bot):
         await state.clear()
         await message.answer("❌ Mas'ul admin aniqlanmadi.", reply_markup=main_menu())
         return
-    order_id = DB.execute("INSERT INTO orders(user_id,admin_id,text,created_at) VALUES(?,?,?,?)", (message.from_user.id, admin_id, text, now())).lastrowid
+    order_cur = DB.execute("INSERT INTO orders(user_id,admin_id,text,created_at) VALUES(?,?,?,?) RETURNING id", (message.from_user.id, admin_id, text, now()))
+    order_id = order_cur.fetchone()["id"]
     DB.commit()
     await state.clear()
     await message.answer("✅ Buyurtmangiz qabul qilindi.", reply_markup=main_menu())
@@ -1054,7 +1079,7 @@ async def payment_decision(callback: CallbackQuery, bot: Bot):
         user = get_user(payment["user_id"])
         if not user:
             DB.execute(
-                "INSERT OR IGNORE INTO users(user_id, username, first_name, created_at) VALUES(?, ?, ?, ?)",
+                "INSERT INTO users(user_id, username, first_name, created_at) VALUES(?, ?, ?, ?) ON CONFLICT(user_id) DO NOTHING",
                 (payment["user_id"], "", "", now())
             )
             DB.commit()
