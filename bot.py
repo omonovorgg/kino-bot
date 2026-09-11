@@ -165,7 +165,8 @@ def init_db():
         id SERIAL PRIMARY KEY,
         code TEXT UNIQUE NOT NULL,
         title TEXT NOT NULL,
-        file_id TEXT NOT NULL,
+        file_id TEXT,
+        link_url TEXT,
         prime_only INTEGER NOT NULL DEFAULT 0,
         views INTEGER NOT NULL DEFAULT 0,
         added_by BIGINT,
@@ -217,6 +218,12 @@ def init_db():
     ]
     for table, column in telegram_id_columns:
         DB.execute(f'ALTER TABLE "{table}" ALTER COLUMN "{column}" TYPE BIGINT')
+
+    # Movie files are optional now: a movie/serial can be delivered by a
+    # Telegram/private-channel link instead of a Telegram video file.
+    DB.execute("ALTER TABLE movies ALTER COLUMN file_id DROP NOT NULL")
+    DB.execute("ALTER TABLE movies ADD COLUMN IF NOT EXISTS link_url TEXT")
+
     DB.execute("INSERT INTO channels(username, title) VALUES(?, ?) ON CONFLICT(username) DO NOTHING", (DEFAULT_CHANNEL, "Uz KinoCinema"))
     DB.commit()
 
@@ -336,6 +343,12 @@ def main_menu():
 def back_cancel():
     return ReplyKeyboardMarkup(keyboard=[[KeyboardButton(text="⬅️ Orqaga"), KeyboardButton(text="❌ Bekor qilish")]], resize_keyboard=True)
 
+def movie_media_keyboard():
+    return ReplyKeyboardMarkup(keyboard=[
+        [KeyboardButton(text="⏭ O'tkazib yuborish")],
+        [KeyboardButton(text="⬅️ Orqaga"), KeyboardButton(text="❌ Bekor qilish")],
+    ], resize_keyboard=True)
+
 
 def admin_menu(user):
     rows = [
@@ -408,6 +421,7 @@ class MovieAddState(StatesGroup):
     code = State()
     title = State()
     video = State()
+    link = State()
     type = State()
 class MovieDeleteState(StatesGroup):
     code = State()
@@ -586,6 +600,29 @@ async def subscription_check(callback: CallbackQuery, bot: Bot, state: FSMContex
     else:
         await callback.answer("❌ Hali kanalga obuna bo'lmagansiz.", show_alert=True)
 
+async def deliver_movie(message: Message, movie):
+    """Deliver a movie either as Telegram video or as a viewing link."""
+    title = escape(movie["title"])
+    code = escape(movie["code"])
+    link = (movie.get("link_url") if hasattr(movie, "get") else None) or ""
+    file_id = (movie.get("file_id") if hasattr(movie, "get") else None) or ""
+
+    if link:
+        await message.answer(
+            f"🎬 {title}\n🔢 Kod: {code}\n\n🔗 To'liq tomosha qilish uchun:\n{escape(link)}\n\n🍿 Yoqimli tomosha!"
+        )
+        return
+
+    if file_id:
+        await message.answer_video(
+            file_id,
+            caption=f"🎬 {title}\n🔢 Kod: {code}\n\n🍿 Yoqimli tomosha!"
+        )
+        return
+
+    raise ValueError("Kino uchun video ham, link ham saqlanmagan")
+
+
 # =========================
 # GLOBAL FSM SAFETY
 # This is intentionally BEFORE all no-state fallbacks,
@@ -624,10 +661,10 @@ async def search_code(message: Message, state: FSMContext):
     DB.execute("UPDATE movies SET views=views+1 WHERE id=?", (movie["id"],))
     DB.commit()
     try:
-        await message.answer_video(movie["file_id"], caption=f"🎬 {escape(movie['title'])}\n🔢 Kod: {escape(movie['code'])}\n\n🍿 Yoqimli tomosha!")
+        await deliver_movie(message, movie)
     except Exception:
-        logger.exception("Video yuborishda xato")
-        await message.answer("❌ Videoni yuborishda xatolik yuz berdi.")
+        logger.exception("Kino yuborishda xato")
+        await message.answer("❌ Kino/linkni yuborishda xatolik yuz berdi.")
     await state.clear()
 
 
@@ -642,7 +679,7 @@ async def movie_add_code(message: Message, state: FSMContext):
         return
     await state.update_data(code=code)
     await state.set_state(MovieAddState.title)
-    await message.answer("🎬 Kino qo'shish — 2/4\n\nKino nomini yuboring.", reply_markup=back_cancel())
+    await message.answer("🎬 Kino qo'shish — 2/5\n\nKino nomini yuboring.", reply_markup=back_cancel())
 
 
 @router.message(MovieAddState.title, F.text, ~F.text.in_({"⬅️ Orqaga", "❌ Bekor qilish"}))
@@ -653,19 +690,47 @@ async def movie_add_title(message: Message, state: FSMContext):
         return
     await state.update_data(title=title)
     await state.set_state(MovieAddState.video)
-    await message.answer("🎬 Kino qo'shish — 3/4\n\nKino videosini yuboring.", reply_markup=back_cancel())
+    await message.answer(
+        "🎬 Kino qo'shish — 3/5\n\n"
+        "VIDEO yuboring.\n"
+        "⚠️ Video majburiy. Link keyingi bosqichda ixtiyoriy bo'ladi.",
+        reply_markup=back_cancel()
+    )
 
 
 @router.message(MovieAddState.video, F.video)
 async def movie_add_video(message: Message, state: FSMContext):
     await state.update_data(file_id=message.video.file_id)
-    await state.set_state(MovieAddState.type)
-    await message.answer("🎬 Kino qo'shish — 4/4\n\nKino turini tanlang:", reply_markup=movie_type_keyboard())
+    await state.set_state(MovieAddState.link)
+    await message.answer(
+        "🎬 Kino qo'shish — 4/5\n\n"
+        "🔗 Agar to'liq film/serial maxfiy kanal yoki xabarda bo'lsa, uning linkini yuboring.\n"
+        "Kerak bo'lmasa, ⏭ O'tkazib yuborish tugmasini bosing.",
+        reply_markup=movie_media_keyboard()
+    )
 
 
-@router.message(MovieAddState.video, ~F.text.in_({"⬅️ Orqaga", "❌ Bekor qilish"}))
+@router.message(MovieAddState.video, F.text, ~F.text.in_({"⬅️ Orqaga", "❌ Bekor qilish"}))
 async def movie_add_video_wrong(message: Message):
-    await message.answer("🎬 Iltimos, kino videosini VIDEO ko'rinishida yuboring.")
+    await message.answer("🎬 Iltimos, kino videosini VIDEO ko'rinishida yuboring. Bu bosqichni o'tkazib yuborib bo'lmaydi.")
+
+
+@router.message(MovieAddState.link, F.text == "⏭ O'tkazib yuborish")
+async def movie_add_link_skip(message: Message, state: FSMContext):
+    await state.update_data(link_url=None)
+    await state.set_state(MovieAddState.type)
+    await message.answer("🎬 Kino qo'shish — 5/5\n\nKino turini tanlang:", reply_markup=movie_type_keyboard())
+
+
+@router.message(MovieAddState.link, F.text, ~F.text.in_({"⬅️ Orqaga", "❌ Bekor qilish", "⏭ O'tkazib yuborish"}))
+async def movie_add_link(message: Message, state: FSMContext):
+    link = message.text.strip()
+    if not (link.startswith("https://t.me/") or link.startswith("http://t.me/") or link.startswith("https://telegram.me/") or link.startswith("http://telegram.me/")):
+        await message.answer("❌ Telegram linkini yuboring. Masalan: https://t.me/c/123456789/123 yoki https://t.me/username/123")
+        return
+    await state.update_data(link_url=link)
+    await state.set_state(MovieAddState.type)
+    await message.answer("🎬 Kino qo'shish — 5/5\n\nKino turini tanlang:", reply_markup=movie_type_keyboard())
 
 
 @router.callback_query(MovieAddState.type, F.data.startswith("movie_type:"))
@@ -674,9 +739,15 @@ async def movie_add_type(callback: CallbackQuery, state: FSMContext):
         await callback.answer("❌ Admin huquqi kerak.", show_alert=True)
         return
     data = await state.get_data()
+    if not data.get("file_id"):
+        await callback.answer("❌ Kino videosi majburiy.", show_alert=True)
+        return
     prime_only = 1 if callback.data.endswith(":1") else 0
     try:
-        DB.execute("INSERT INTO movies(code,title,file_id,prime_only,views,added_by,created_at) VALUES(?,?,?,?,?,?,?)", (data["code"], data["title"], data["file_id"], prime_only, 0, callback.from_user.id, now()))
+        DB.execute(
+            "INSERT INTO movies(code,title,file_id,link_url,prime_only,views,added_by,created_at) VALUES(?,?,?,?,?,?,?,?)",
+            (data["code"], data["title"], data.get("file_id"), data.get("link_url"), prime_only, 0, callback.from_user.id, now())
+        )
         DB.commit()
     except psycopg2.IntegrityError:
         DB.conn.rollback()
@@ -684,7 +755,11 @@ async def movie_add_type(callback: CallbackQuery, state: FSMContext):
         return
     await state.clear()
     await callback.answer("✅ Kino qo'shildi!")
-    await callback.message.answer(f"✅ Kino qo'shildi!\n\nKod: {escape(data['code'])}\nNomi: {escape(data['title'])}\nTuri: {'Prime' if prime_only else 'Oddiy'}", reply_markup=admin_menu(callback.from_user))
+    delivery = "🔗 Link orqali" if data.get("link_url") and not data.get("file_id") else ("🎬 Video + link" if data.get("link_url") else "🎬 Video")
+    await callback.message.answer(
+        f"✅ Kino qo'shildi!\n\nKod: {escape(data['code'])}\nNomi: {escape(data['title'])}\nTuri: {'Prime' if prime_only else 'Oddiy'}\nUsul: {delivery}",
+        reply_markup=admin_menu(callback.from_user)
+    )
 
 
 @router.message(CardState.number, F.text, ~F.text.in_({"⬅️ Orqaga", "❌ Bekor qilish"}))
@@ -900,9 +975,11 @@ async def back_any(message: Message, state: FSMContext):
     elif current == CardState.number.state:
         await state.clear(); await message.answer("💳 Karta sozlamalari", reply_markup=card_menu())
     elif current == MovieAddState.type.state:
-        await state.set_state(MovieAddState.video); await message.answer("🎬 Kino videosini yuboring.", reply_markup=back_cancel())
+        await state.set_state(MovieAddState.link); await message.answer("🎬 Kino qo'shish — 4/5\n\n🔗 Linkni yuboring yoki ⏭ O'tkazib yuborish tugmasini bosing.", reply_markup=movie_media_keyboard())
+    elif current == MovieAddState.link.state:
+        await state.set_state(MovieAddState.video); await message.answer("🎬 Kino qo'shish — 3/5\n\nVIDEO yuboring. Bu bosqich majburiy.", reply_markup=back_cancel())
     elif current == MovieAddState.video.state:
-        await state.set_state(MovieAddState.title); await message.answer("🎬 Kino nomini yuboring.", reply_markup=back_cancel())
+        await state.set_state(MovieAddState.title); await message.answer("🎬 Kino qo'shish — 2/5\n\nKino nomini yuboring.", reply_markup=back_cancel())
     elif current == MovieAddState.title.state:
         await state.set_state(MovieAddState.code); await message.answer("🎬 Kino kodini yuboring.", reply_markup=back_cancel())
     elif current == MovieAddState.code.state or current == MovieDeleteState.code.state:
@@ -984,7 +1061,7 @@ async def ads(message: Message):
 async def movie_add_start(message: Message, state: FSMContext):
     if not is_admin_user(message.from_user): return
     await state.set_state(MovieAddState.code)
-    await message.answer("🎬 Kino qo'shish — 1/4\n\nKino kodini yuboring.", reply_markup=back_cancel())
+    await message.answer("🎬 Kino qo'shish — 1/5\n\nKino kodini yuboring.", reply_markup=back_cancel())
 
 
 @router.message(StateFilter(None), F.text == "🗑 Kino o'chirish")
@@ -1133,10 +1210,10 @@ async def numeric_movie_fallback(message: Message):
         await message.answer("⭐ Bu kino faqat Prime uchun."); return
     DB.execute("UPDATE movies SET views=views+1 WHERE id=?", (movie["id"],)); DB.commit()
     try:
-        await message.answer_video(movie["file_id"], caption=f"🎬 {escape(movie['title'])}\n🔢 Kod: {escape(movie['code'])}\n\n🍿 Yoqimli tomosha!")
+        await deliver_movie(message, movie)
     except Exception:
-        logger.exception("Fallback video yuborishda xato")
-        await message.answer("❌ Videoni yuborishda xatolik yuz berdi.")
+        logger.exception("Fallback kino yuborishda xato")
+        await message.answer("❌ Kino/linkni yuborishda xatolik yuz berdi.")
 
 # Last fallback is explicitly NO STATE.
 @router.message(StateFilter(None))
