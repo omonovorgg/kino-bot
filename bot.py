@@ -521,13 +521,13 @@ async def search_code(message: Message, state: FSMContext):
         movie = DB.execute("SELECT * FROM movies WHERE code=?", (query,)).fetchone()
     elif not query.isdigit():
         movie = DB.execute(
-            "SELECT * FROM movies WHERE title LIKE ? COLLATE NOCASE ORDER BY id DESC LIMIT 1",
+            "SELECT * FROM movies WHERE title ILIKE ? ORDER BY id DESC LIMIT 1",
             (f"%{query}%",)
         ).fetchone()
     else:
         # 3 xonali bo'lmagan son kino kodi emas. Uni nom ichidan qidiramiz.
         movie = DB.execute(
-            "SELECT * FROM movies WHERE title LIKE ? COLLATE NOCASE ORDER BY id DESC LIMIT 1",
+            "SELECT * FROM movies WHERE title ILIKE ? ORDER BY id DESC LIMIT 1",
             (f"%{query}%",)
         ).fetchone()
 
