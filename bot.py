@@ -350,16 +350,47 @@ def movie_media_keyboard():
     ], resize_keyboard=True)
 
 
+def movie_management_menu():
+    return ReplyKeyboardMarkup(keyboard=[
+        [KeyboardButton(text="➕ Kino qo'shish"), KeyboardButton(text="✏️ Kino tahrirlash")],
+        [KeyboardButton(text="🗑 Kino o'chirish"), KeyboardButton(text="📚 Kinolar")],
+        [KeyboardButton(text="⬅️ Admin panel")],
+    ], resize_keyboard=True)
+
+
 def admin_menu(user):
     rows = [
-        [KeyboardButton(text="🎬 Kino qo'shish"), KeyboardButton(text="🗑 Kino o'chirish")],
-        [KeyboardButton(text="📚 Kinolar"), KeyboardButton(text="📊 Statistika")],
-        [KeyboardButton(text="💳 Karta sozlamalari"), KeyboardButton(text="📢 Kanallar")],
-        [KeyboardButton(text="🔗 Mening referralim")],
+        [KeyboardButton(text="🎬 Kino boshqaruvi")],
+        [KeyboardButton(text="📊 Statistika"), KeyboardButton(text="💳 Karta sozlamalari")],
+        [KeyboardButton(text="📢 Kanallar"), KeyboardButton(text="🔗 Mening referralim")],
     ]
     if is_superadmin_user(user):
-        rows.insert(3, [KeyboardButton(text="👥 Adminlar")])
+        rows.append([KeyboardButton(text="👥 Adminlar")])
     return ReplyKeyboardMarkup(keyboard=rows, resize_keyboard=True)
+
+
+def movie_edit_keyboard():
+    b = InlineKeyboardBuilder()
+    b.row(
+        InlineKeyboardButton(text="✏️ Kod", callback_data="movie_edit:code"),
+        InlineKeyboardButton(text="📝 Nomi", callback_data="movie_edit:title"),
+    )
+    b.row(
+        InlineKeyboardButton(text="🎬 Video", callback_data="movie_edit:video"),
+        InlineKeyboardButton(text="🔗 Link", callback_data="movie_edit:link"),
+    )
+    b.row(InlineKeyboardButton(text="⭐ Kino turi", callback_data="movie_edit:type"))
+    b.row(InlineKeyboardButton(text="⬅️ Kino boshqaruvi", callback_data="movie_edit:back"))
+    return b.as_markup()
+
+
+def movie_delete_confirm_keyboard(movie_id):
+    b = InlineKeyboardBuilder()
+    b.row(
+        InlineKeyboardButton(text="✅ Ha, o'chirish", callback_data=f"movie_delete:yes:{movie_id}"),
+        InlineKeyboardButton(text="❌ Yo'q", callback_data="movie_delete:no"),
+    )
+    return b.as_markup()
 
 
 def card_menu():
@@ -425,6 +456,18 @@ class MovieAddState(StatesGroup):
     type = State()
 class MovieDeleteState(StatesGroup):
     code = State()
+    confirm = State()
+
+
+class MovieEditState(StatesGroup):
+    code = State()
+    menu = State()
+    edit_code = State()
+    title = State()
+    video = State()
+    link = State()
+    type = State()
+
 class AdminAddState(StatesGroup):
     user = State()
 class AdminDeleteState(StatesGroup):
@@ -511,7 +554,8 @@ class ActiveStateLockMiddleware(BaseMiddleware):
     MENU_TEXTS = {
         "🔎 Kino qidirish", "⭐ Prime status", "📚 Kinolar ro'yxati",
         "📸 Instagramga qaytish", "🎬 Kino buyurtma qilish",
-        "🤝 Reklama & Bot olish", "🎬 Kino qo'shish", "🗑 Kino o'chirish",
+        "🤝 Reklama & Bot olish", "🎬 Kino boshqaruvi",
+        "➕ Kino qo'shish", "✏️ Kino tahrirlash", "🗑 Kino o'chirish",
         "📚 Kinolar", "📊 Statistika", "💳 Karta sozlamalari",
         "📢 Kanallar", "🔗 Mening referralim", "👥 Adminlar",
         "➕ Admin qo'shish", "🗑 Admin o'chirish", "📋 Adminlar",
@@ -534,6 +578,8 @@ class ActiveStateLockMiddleware(BaseMiddleware):
             # FSM davomida boshqa inline tugmalar ham boshqa buyruqqa
             # olib o'tmasin. Joriy kino turi tugmalari bundan mustasno.
             if current == MovieAddState.type.state and (event.data or "").startswith("movie_type:"):
+                return await handler(event, data)
+            if current in {MovieEditState.menu.state, MovieEditState.link.state, MovieEditState.type.state, MovieDeleteState.confirm.state} and (event.data or "").startswith(("movie_edit:", "movie_delete:")):
                 return await handler(event, data)
             await event.answer("⏳ Avval joriy jarayonni tugating yoki ❌ Bekor qilishni bosing.", show_alert=True)
             return
@@ -755,10 +801,10 @@ async def movie_add_type(callback: CallbackQuery, state: FSMContext):
         return
     await state.clear()
     await callback.answer("✅ Kino qo'shildi!")
-    delivery = "🔗 Link orqali" if data.get("link_url") and not data.get("file_id") else ("🎬 Video + link" if data.get("link_url") else "🎬 Video")
+    delivery = "🎬 Video + link" if data.get("link_url") else "🎬 Video"
     await callback.message.answer(
         f"✅ Kino qo'shildi!\n\nKod: {escape(data['code'])}\nNomi: {escape(data['title'])}\nTuri: {'Prime' if prime_only else 'Oddiy'}\nUsul: {delivery}",
-        reply_markup=admin_menu(callback.from_user)
+        reply_markup=movie_management_menu()
     )
 
 
@@ -889,19 +935,288 @@ async def channel_delete(message: Message, state: FSMContext):
 
 
 @router.message(MovieDeleteState.code, F.text, ~F.text.in_({"⬅️ Orqaga", "❌ Bekor qilish"}))
-async def movie_delete(message: Message, state: FSMContext):
+async def movie_delete_code(message: Message, state: FSMContext):
+    if not is_admin_user(message.from_user):
+        await state.clear()
+        await message.answer("❌ Admin huquqi kerak.", reply_markup=main_menu())
+        return
     code = message.text.strip()
     if not code.isdigit() or len(code) != 3:
-        await message.answer("❌ Kino kodi aynan 3 xonali raqam bo'lishi kerak.")
+        await message.answer("❌ Kino kodi aynan 3 xonali raqam bo'lishi kerak. Masalan: 327")
         return
     movie = DB.execute("SELECT * FROM movies WHERE code=?", (code,)).fetchone()
     if not movie:
-        await message.answer("❌ Bunday kino topilmadi.")
+        await message.answer("❌ Bunday kino topilmadi. Qayta urinib ko'ring.")
         return
-    DB.execute("DELETE FROM movies WHERE code=?", (code,))
+    await state.update_data(movie_id=movie["id"], code=movie["code"])
+    await state.set_state(MovieDeleteState.confirm)
+    await message.answer(
+        f"⚠️ Kino o'chiriladi!\n\n"
+        f"🎬 {escape(movie['title'])}\n"
+        f"🔢 Kod: {escape(movie['code'])}\n"
+        f"⭐ Turi: {'Prime' if movie['prime_only'] else 'Oddiy'}\n"
+        f"👁 Ko'rishlar: {movie['views']}\n\n"
+        "Bu amalni qaytarib bo'lmaydi. Davom etamizmi?",
+        reply_markup=movie_delete_confirm_keyboard(movie["id"])
+    )
+
+
+@router.callback_query(MovieDeleteState.confirm, F.data.startswith("movie_delete:"))
+async def movie_delete_decision(callback: CallbackQuery, state: FSMContext):
+    if not is_admin_user(callback.from_user):
+        await state.clear()
+        await callback.answer("❌ Admin huquqi kerak.", show_alert=True)
+        return
+    if callback.data == "movie_delete:no":
+        await state.clear()
+        await callback.answer("Bekor qilindi.")
+        try:
+            await callback.message.edit_reply_markup(reply_markup=None)
+        except Exception:
+            pass
+        await callback.message.answer("🗑 Kino o'chirish bekor qilindi.", reply_markup=movie_management_menu())
+        return
+    parts = callback.data.split(":")
+    if len(parts) != 3 or parts[1] != "yes":
+        await callback.answer("❌ So'rov xato.", show_alert=True)
+        return
+    try:
+        movie_id = int(parts[2])
+    except ValueError:
+        await callback.answer("❌ Kino ID xato.", show_alert=True)
+        return
+    data = await state.get_data()
+    if data.get("movie_id") != movie_id:
+        await callback.answer("❌ So'rov eskirgan.", show_alert=True)
+        return
+    movie = DB.execute("SELECT * FROM movies WHERE id=?", (movie_id,)).fetchone()
+    if not movie:
+        await state.clear()
+        await callback.answer("ℹ️ Kino allaqachon o'chirilgan.", show_alert=True)
+        try:
+            await callback.message.edit_reply_markup(reply_markup=None)
+        except Exception:
+            pass
+        await callback.message.answer("ℹ️ Kino topilmadi.", reply_markup=movie_management_menu())
+        return
+    DB.execute("DELETE FROM movies WHERE id=?", (movie_id,))
     DB.commit()
     await state.clear()
-    await message.answer("✅ Kino o'chirildi.", reply_markup=admin_menu(message.from_user))
+    await callback.answer("✅ Kino o'chirildi!")
+    try:
+        await callback.message.edit_reply_markup(reply_markup=None)
+    except Exception:
+        pass
+    await callback.message.answer(
+        f"✅ Kino o'chirildi.\n\n🎬 {escape(movie['title'])}\n🔢 Kod: {escape(movie['code'])}",
+        reply_markup=movie_management_menu()
+    )
+
+
+# =========================
+# MOVIE EDITING
+# =========================
+@router.message(MovieEditState.code, F.text, ~F.text.in_({"⬅️ Orqaga", "❌ Bekor qilish"}))
+async def movie_edit_code_lookup(message: Message, state: FSMContext):
+    if not is_admin_user(message.from_user):
+        await state.clear()
+        await message.answer("❌ Admin huquqi kerak.", reply_markup=main_menu())
+        return
+    code = message.text.strip()
+    if not code.isdigit() or len(code) != 3:
+        await message.answer("❌ Kino kodi aynan 3 xonali raqam bo'lishi kerak. Masalan: 327")
+        return
+    movie = DB.execute("SELECT * FROM movies WHERE code=?", (code,)).fetchone()
+    if not movie:
+        await message.answer("❌ Bunday kino topilmadi. Qayta urinib ko'ring.")
+        return
+    await state.update_data(movie_id=movie["id"], original_code=movie["code"])
+    await state.set_state(MovieEditState.menu)
+    await message.answer(
+        f"✏️ Kino tahrirlash\n\n"
+        f"🎬 Nomi: {escape(movie['title'])}\n"
+        f"🔢 Kod: {escape(movie['code'])}\n"
+        f"⭐ Turi: {'Prime' if movie['prime_only'] else 'Oddiy'}\n"
+        f"👁 Ko'rishlar: {movie['views']}\n"
+        f"🎬 Video: {'Bor' if movie['file_id'] else 'Yo‘q'}\n"
+        f"🔗 Link: {'Bor' if movie['link_url'] else 'Yo‘q'}\n\n"
+        "Qaysi qismini o'zgartirasiz?",
+        reply_markup=movie_edit_keyboard()
+    )
+
+
+@router.callback_query(F.data.startswith("movie_edit:"))
+async def movie_edit_callback(callback: CallbackQuery, state: FSMContext):
+    if not is_admin_user(callback.from_user):
+        await state.clear()
+        await callback.answer("❌ Admin huquqi kerak.", show_alert=True)
+        return
+    current = await state.get_state()
+    if not current or not current.startswith("MovieEditState:"):
+        await callback.answer("⏳ Avval kino tahrirlashni boshlang.", show_alert=True)
+        return
+    action = callback.data.split(":", 1)[1]
+    data = await state.get_data()
+    movie_id = data.get("movie_id")
+    movie = DB.execute("SELECT * FROM movies WHERE id=?", (movie_id,)).fetchone()
+    if not movie:
+        await state.clear()
+        await callback.answer("❌ Kino topilmadi.", show_alert=True)
+        try:
+            await callback.message.edit_reply_markup(reply_markup=None)
+        except Exception:
+            pass
+        await callback.message.answer("❌ Kino topilmadi.", reply_markup=movie_management_menu())
+        return
+
+    if action == "back":
+        if current != MovieEditState.menu.state:
+            await callback.answer("⏳ Avval joriy tahrirlash bosqichini tugating yoki Orqaga bosing.", show_alert=True)
+            return
+        await state.clear()
+        await callback.answer()
+        try:
+            await callback.message.edit_reply_markup(reply_markup=None)
+        except Exception:
+            pass
+        await callback.message.answer("🎬 Kino boshqaruvi", reply_markup=movie_management_menu())
+        return
+
+    if action == "return_menu":
+        if current not in {MovieEditState.link.state, MovieEditState.type.state}:
+            await callback.answer("⏳ Hozirgi amal uchun Orqaga tugmasidan foydalaning.", show_alert=True)
+            return
+        await state.set_state(MovieEditState.menu)
+        await callback.answer()
+        try:
+            await callback.message.edit_reply_markup(reply_markup=None)
+        except Exception:
+            pass
+        await callback.message.answer("✏️ Qaysi qismini o'zgartirasiz?", reply_markup=movie_edit_keyboard())
+        return
+
+    if action == "link_remove":
+        if current != MovieEditState.link.state:
+            await callback.answer("⏳ Hozir link tahrirlash bosqichi emas.", show_alert=True)
+            return
+        DB.execute("UPDATE movies SET link_url=NULL WHERE id=?", (movie_id,))
+        DB.commit()
+        await state.set_state(MovieEditState.menu)
+        await callback.answer("✅ Link olib tashlandi.")
+        try:
+            await callback.message.edit_reply_markup(reply_markup=None)
+        except Exception:
+            pass
+        await callback.message.answer("✅ Link olib tashlandi.", reply_markup=movie_edit_keyboard())
+        return
+
+    if action in {"type:0", "type:1"}:
+        if current != MovieEditState.type.state:
+            await callback.answer("⏳ Hozir kino turi tanlash bosqichi emas.", show_alert=True)
+            return
+        value = int(action.rsplit(":", 1)[1])
+        DB.execute("UPDATE movies SET prime_only=? WHERE id=?", (value, movie_id))
+        DB.commit()
+        await state.set_state(MovieEditState.menu)
+        await callback.answer("✅ Kino turi o'zgartirildi.")
+        try:
+            await callback.message.edit_reply_markup(reply_markup=None)
+        except Exception:
+            pass
+        await callback.message.answer("✅ Kino turi o'zgartirildi.", reply_markup=movie_edit_keyboard())
+        return
+
+    mapping = {
+        "code": (MovieEditState.edit_code, "✏️ Yangi kino kodini yuboring. Kod aynan 3 xonali bo'lishi kerak."),
+        "title": (MovieEditState.title, "📝 Yangi kino nomini yuboring."),
+        "video": (MovieEditState.video, "🎬 Yangi VIDEO yuboring."),
+        "link": (MovieEditState.link, "🔗 Yangi Telegram linkini yuboring yoki linkni olib tashlash uchun tugmani bosing."),
+        "type": (MovieEditState.type, "⭐ Kino turini tanlang."),
+    }
+    if action not in mapping:
+        await callback.answer("❌ Noma'lum amal.", show_alert=True)
+        return
+    new_state, prompt = mapping[action]
+    await state.set_state(new_state)
+    await callback.answer()
+    if action == "link":
+        b = InlineKeyboardBuilder()
+        b.row(InlineKeyboardButton(text="🗑 Linkni olib tashlash", callback_data="movie_edit:link_remove"))
+        b.row(InlineKeyboardButton(text="⬅️ Orqaga", callback_data="movie_edit:return_menu"))
+        await callback.message.answer(prompt, reply_markup=b.as_markup())
+    elif action == "type":
+        b = InlineKeyboardBuilder()
+        b.row(
+            InlineKeyboardButton(text="🆓 Oddiy kino", callback_data="movie_edit:type:0"),
+            InlineKeyboardButton(text="⭐ Faqat Prime", callback_data="movie_edit:type:1"),
+        )
+        b.row(InlineKeyboardButton(text="⬅️ Orqaga", callback_data="movie_edit:return_menu"))
+        await callback.message.answer(prompt, reply_markup=b.as_markup())
+    else:
+        await callback.message.answer(prompt, reply_markup=back_cancel())
+
+
+@router.message(MovieEditState.edit_code, F.text, ~F.text.in_({"⬅️ Orqaga", "❌ Bekor qilish"}))
+async def movie_edit_save_code(message: Message, state: FSMContext):
+    code = message.text.strip()
+    if not code.isdigit() or len(code) != 3:
+        await message.answer("❌ Kino kodi aynan 3 xonali raqam bo'lishi kerak. Masalan: 327")
+        return
+    data = await state.get_data()
+    movie_id = data.get("movie_id")
+    existing = DB.execute("SELECT id FROM movies WHERE code=? AND id<>?", (code, movie_id)).fetchone()
+    if existing:
+        await message.answer("❌ Bu kod boshqa kinoga tegishli. Boshqa kod tanlang.")
+        return
+    try:
+        DB.execute("UPDATE movies SET code=? WHERE id=?", (code, movie_id))
+        DB.commit()
+    except psycopg2.IntegrityError:
+        DB.rollback()
+        await message.answer("❌ Bu kod boshqa kinoga tegishli. Boshqa kod tanlang.")
+        return
+    await state.set_state(MovieEditState.menu)
+    await message.answer("✅ Kino kodi o'zgartirildi.", reply_markup=movie_edit_keyboard())
+
+
+@router.message(MovieEditState.title, F.text, ~F.text.in_({"⬅️ Orqaga", "❌ Bekor qilish"}))
+async def movie_edit_save_title(message: Message, state: FSMContext):
+    title = message.text.strip()
+    if not title:
+        await message.answer("❌ Kino nomi bo'sh bo'lmasin.")
+        return
+    data = await state.get_data()
+    DB.execute("UPDATE movies SET title=? WHERE id=?", (title, data.get("movie_id")))
+    DB.commit()
+    await state.set_state(MovieEditState.menu)
+    await message.answer("✅ Kino nomi o'zgartirildi.", reply_markup=movie_edit_keyboard())
+
+
+@router.message(MovieEditState.video, F.video)
+async def movie_edit_save_video(message: Message, state: FSMContext):
+    data = await state.get_data()
+    DB.execute("UPDATE movies SET file_id=? WHERE id=?", (message.video.file_id, data.get("movie_id")))
+    DB.commit()
+    await state.set_state(MovieEditState.menu)
+    await message.answer("✅ Kino videosi almashtirildi.", reply_markup=movie_edit_keyboard())
+
+
+@router.message(MovieEditState.video, F.text, ~F.text.in_({"⬅️ Orqaga", "❌ Bekor qilish"}))
+async def movie_edit_video_wrong(message: Message):
+    await message.answer("🎬 Iltimos, yangi videoni VIDEO ko'rinishida yuboring.")
+
+
+@router.message(MovieEditState.link, F.text, ~F.text.in_({"⬅️ Orqaga", "❌ Bekor qilish"}))
+async def movie_edit_save_link(message: Message, state: FSMContext):
+    link = message.text.strip()
+    if not (link.startswith("https://t.me/") or link.startswith("http://t.me/") or link.startswith("https://telegram.me/") or link.startswith("http://telegram.me/")):
+        await message.answer("❌ Telegram linkini yuboring. Masalan: https://t.me/c/123456789/123")
+        return
+    data = await state.get_data()
+    DB.execute("UPDATE movies SET link_url=? WHERE id=?", (link, data.get("movie_id")))
+    DB.commit()
+    await state.set_state(MovieEditState.menu)
+    await message.answer("✅ Kino linki saqlandi.", reply_markup=movie_edit_keyboard())
 
 
 @router.message(PaymentState.screenshot, F.photo)
@@ -962,6 +1277,8 @@ async def cancel_any(message: Message, state: FSMContext):
         await message.answer("❌ Bekor qilindi.", reply_markup=card_menu())
     elif current and current.startswith(("SearchState", "PaymentState", "OrderState")):
         await message.answer("❌ Bekor qilindi.", reply_markup=main_menu())
+    elif current and current.startswith(("MovieEditState", "MovieDeleteState", "MovieAddState")):
+        await message.answer("❌ Bekor qilindi.", reply_markup=movie_management_menu())
     else:
         await message.answer("❌ Bekor qilindi.", reply_markup=admin_menu(message.from_user) if is_admin_user(message.from_user) else main_menu())
 
@@ -974,6 +1291,15 @@ async def back_any(message: Message, state: FSMContext):
         await message.answer("💳 Karta raqamini yuboring.", reply_markup=back_cancel())
     elif current == CardState.number.state:
         await state.clear(); await message.answer("💳 Karta sozlamalari", reply_markup=card_menu())
+    elif current == MovieEditState.menu.state:
+        await state.clear(); await message.answer("🎬 Kino boshqaruvi", reply_markup=movie_management_menu())
+    elif current in {MovieEditState.edit_code.state, MovieEditState.title.state, MovieEditState.video.state, MovieEditState.link.state, MovieEditState.type.state}:
+        await state.set_state(MovieEditState.menu)
+        await message.answer("✏️ Kino tahrirlash", reply_markup=movie_edit_keyboard())
+    elif current == MovieDeleteState.confirm.state:
+        await state.clear(); await message.answer("🗑 Kino o'chirish bekor qilindi.", reply_markup=movie_management_menu())
+    elif current == MovieDeleteState.code.state:
+        await state.clear(); await message.answer("🎬 Kino boshqaruvi", reply_markup=movie_management_menu())
     elif current == MovieAddState.type.state:
         await state.set_state(MovieAddState.link); await message.answer("🎬 Kino qo'shish — 4/5\n\n🔗 Linkni yuboring yoki ⏭ O'tkazib yuborish tugmasini bosing.", reply_markup=movie_media_keyboard())
     elif current == MovieAddState.link.state:
@@ -1034,8 +1360,26 @@ async def choose_prime(callback: CallbackQuery, state: FSMContext):
 async def user_movies(message: Message):
     rows = DB.execute("SELECT * FROM movies ORDER BY id DESC").fetchall()
     if not rows:
-        await message.answer("📚 Hozircha kinolar mavjud emas."); return
-    await message.answer("📚 Kinolar ro'yxati\n\n" + "\n\n".join(f"{'⭐' if r['prime_only'] else '🎬'} {escape(r['title'])}\n🔢 Kod: {escape(r['code'])} | 👁 {r['views']}" for r in rows))
+        await message.answer("📚 Hozircha kinolar mavjud emas.")
+        return
+    blocks = [
+        f"{'⭐' if r['prime_only'] else '🎬'} {escape(r['title'])}\n🔢 Kod: {escape(r['code'])} | 👁 {r['views']}"
+        for r in rows
+    ]
+    chunks, current = [], ""
+    for block in blocks:
+        candidate = block if not current else current + "\n\n" + block
+        if len(candidate) > 3500:
+            if current:
+                chunks.append(current)
+            current = block
+        else:
+            current = candidate
+    if current:
+        chunks.append(current)
+    for i, chunk in enumerate(chunks, 1):
+        prefix = f"📚 Kinolar ro'yxati — {i}/{len(chunks)}\n\n" if len(chunks) > 1 else "📚 Kinolar ro'yxati\n\n"
+        await message.answer(prefix + chunk)
 
 
 @router.message(StateFilter(None), F.text == "📸 Instagramga qaytish")
@@ -1057,26 +1401,60 @@ async def ads(message: Message):
 # =========================
 # NO-STATE ADMIN MENU
 # =========================
-@router.message(StateFilter(None), F.text == "🎬 Kino qo'shish")
+@router.message(StateFilter(None), F.text == "🎬 Kino boshqaruvi")
+async def movie_management_start(message: Message, state: FSMContext):
+    if not is_admin_user(message.from_user): return
+    await state.clear()
+    await message.answer("🎬 Kino boshqaruvi", reply_markup=movie_management_menu())
+
+
+@router.message(StateFilter(None), F.text == "➕ Kino qo'shish")
 async def movie_add_start(message: Message, state: FSMContext):
     if not is_admin_user(message.from_user): return
     await state.set_state(MovieAddState.code)
     await message.answer("🎬 Kino qo'shish — 1/5\n\nKino kodini yuboring.", reply_markup=back_cancel())
 
 
+@router.message(StateFilter(None), F.text == "✏️ Kino tahrirlash")
+async def movie_edit_start(message: Message, state: FSMContext):
+    if not is_admin_user(message.from_user): return
+    await state.set_state(MovieEditState.code)
+    await message.answer("✏️ Kino tahrirlash\n\nTahrirlamoqchi bo'lgan kino kodini yuboring.\nMasalan: 327", reply_markup=back_cancel())
+
+
 @router.message(StateFilter(None), F.text == "🗑 Kino o'chirish")
 async def movie_delete_start(message: Message, state: FSMContext):
     if not is_admin_user(message.from_user): return
     await state.set_state(MovieDeleteState.code)
-    await message.answer("🗑 Kino kodini yuboring.", reply_markup=back_cancel())
+    await message.answer("🗑 Kino o'chirish\n\nKino kodini yuboring. Masalan: 327", reply_markup=back_cancel())
 
 
 @router.message(StateFilter(None), F.text == "📚 Kinolar")
 async def admin_movies(message: Message):
     if not is_admin_user(message.from_user): return
     rows = DB.execute("SELECT * FROM movies ORDER BY id DESC").fetchall()
-    if not rows: await message.answer("📚 Hozircha kinolar mavjud emas."); return
-    await message.answer("📚 Kinolar\n\n" + "\n\n".join(f"{'⭐' if r['prime_only'] else '🎬'} {escape(r['title'])}\n🔢 {escape(r['code'])} | 👁 {r['views']}" for r in rows))
+    if not rows:
+        await message.answer("📚 Hozircha kinolar mavjud emas.", reply_markup=movie_management_menu())
+        return
+    blocks = [
+        f"{'⭐' if r['prime_only'] else '🎬'} {escape(r['title'])}\n🔢 {escape(r['code'])} | 👁 {r['views']} | 🔗 {'Bor' if r['link_url'] else 'Yo‘q'}"
+        for r in rows
+    ]
+    chunks, current = [], ""
+    for block in blocks:
+        candidate = block if not current else current + "\n\n" + block
+        if len(candidate) > 3500:
+            if current:
+                chunks.append(current)
+            current = block
+        else:
+            current = candidate
+    if current:
+        chunks.append(current)
+    for i, chunk in enumerate(chunks, 1):
+        prefix = f"📚 Kinolar — {i}/{len(chunks)}\n\n" if len(chunks) > 1 else "📚 Kinolar\n\n"
+        await message.answer(prefix + chunk)
+    await message.answer("🎬 Kino boshqaruvi", reply_markup=movie_management_menu())
 
 
 @router.message(StateFilter(None), F.text == "💳 Karta sozlamalari")
