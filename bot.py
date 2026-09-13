@@ -2,6 +2,8 @@
 import os
 import asyncio
 import logging
+import io
+import csv
 import psycopg2
 from psycopg2.extras import RealDictCursor
 from datetime import datetime, timedelta, timezone
@@ -20,6 +22,7 @@ from typing import Any, Awaitable, Callable
 
 from aiogram.types import (
     Message, CallbackQuery, InlineKeyboardButton, ReplyKeyboardMarkup,
+    BufferedInputFile,
     KeyboardButton, BotCommand, BotCommandScopeChat, Update,
 )
 from aiogram.utils.keyboard import InlineKeyboardBuilder
@@ -198,6 +201,27 @@ def init_db():
     );
     """)
 
+    DB.execute("""
+        CREATE TABLE IF NOT EXISTS prime_prices (
+            plan_key TEXT PRIMARY KEY,
+            plan_name TEXT NOT NULL,
+            price INTEGER NOT NULL,
+            days INTEGER NOT NULL,
+            updated_at TEXT NOT NULL
+        )
+    """)
+    defaults = [
+        ("7", "7 kun", 7000, 7),
+        ("1oy", "1 oy", 20000, 30),
+        ("3oy", "3 oy", 50000, 90),
+        ("lifetime", "Umrbod", 150000, 0),
+    ]
+    for key, name, price, days in defaults:
+        DB.execute(
+            "INSERT INTO prime_prices(plan_key,plan_name,price,days,updated_at) VALUES(?,?,?,?,?) ON CONFLICT(plan_key) DO NOTHING",
+            (key, name, price, days, now())
+        )
+
     # Existing Neon tables may have been created by an earlier version using
     # PostgreSQL INTEGER. Telegram IDs can exceed INTEGER's 32-bit range, so
     # migrate every Telegram-ID column to BIGINT. These ALTER statements are
@@ -332,11 +356,10 @@ def prime_until_text(value):
 
 def main_menu():
     return ReplyKeyboardMarkup(keyboard=[
-        [KeyboardButton(text="🔎 Kino qidirish"), KeyboardButton(text="⭐ Prime status")],
-        [KeyboardButton(text="📚 Kinolar ro'yxati")],
-        [KeyboardButton(text="📸 Instagramga qaytish")],
-        [KeyboardButton(text="🎬 Kino buyurtma qilish")],
-        [KeyboardButton(text="🤝 Reklama & Bot olish")],
+        [KeyboardButton(text="🔎 Kino qidirish")],
+        [KeyboardButton(text="⭐ Prime status"), KeyboardButton(text="📚 Kinolar ro'yxati")],
+        [KeyboardButton(text="📸 Instagramga qaytish"), KeyboardButton(text="🎬 Kino buyurtma qilish")],
+        [KeyboardButton(text="🤝 Reklama xizmati")],
     ], resize_keyboard=True)
 
 
@@ -354,6 +377,7 @@ def movie_management_menu():
     return ReplyKeyboardMarkup(keyboard=[
         [KeyboardButton(text="➕ Kino qo'shish"), KeyboardButton(text="✏️ Kino tahrirlash")],
         [KeyboardButton(text="🗑 Kino o'chirish"), KeyboardButton(text="📚 Kinolar")],
+        [KeyboardButton(text="🔎 Kino qidirish")],
         [KeyboardButton(text="⬅️ Admin panel")],
     ], resize_keyboard=True)
 
@@ -361,11 +385,16 @@ def movie_management_menu():
 def admin_menu(user):
     rows = [
         [KeyboardButton(text="🎬 Kino boshqaruvi")],
-        [KeyboardButton(text="📊 Statistika"), KeyboardButton(text="💳 Karta sozlamalari")],
-        [KeyboardButton(text="📢 Kanallar"), KeyboardButton(text="🔗 Mening referralim")],
+        [KeyboardButton(text="📊 Statistika"), KeyboardButton(text="💰 To'lovlar")],
+        [KeyboardButton(text="💳 Karta sozlamalari"), KeyboardButton(text="📢 Kanallar")],
+        [KeyboardButton(text="🔗 Mening referralim")],
     ]
     if is_superadmin_user(user):
-        rows.append([KeyboardButton(text="👥 Adminlar")])
+        rows += [
+            [KeyboardButton(text="📨 Foydalanuvchilarga xabar")],
+            [KeyboardButton(text="🏷 Aksiya / Narxlar")],
+            [KeyboardButton(text="👥 Adminlar"), KeyboardButton(text="🛠 Texnik")],
+        ]
     return ReplyKeyboardMarkup(keyboard=rows, resize_keyboard=True)
 
 
@@ -422,12 +451,21 @@ def subscription_keyboard():
     return b.as_markup()
 
 
+def get_prime_prices():
+    rows = DB.execute("SELECT * FROM prime_prices ORDER BY CASE plan_key WHEN '7' THEN 1 WHEN '1oy' THEN 2 WHEN '3oy' THEN 3 WHEN 'lifetime' THEN 4 ELSE 5 END").fetchall()
+    return rows
+
 def prime_keyboard():
     b = InlineKeyboardBuilder()
-    b.row(InlineKeyboardButton(text="7 kun — 7 000 so'm", callback_data="prime:7:7000:7"))
-    b.row(InlineKeyboardButton(text="1 oy — 20 000 so'm", callback_data="prime:1oy:20000:30"))
-    b.row(InlineKeyboardButton(text="3 oy — 50 000 so'm", callback_data="prime:3oy:50000:90"))
-    b.row(InlineKeyboardButton(text="Umrbod — 150 000 so'm", callback_data="prime:lifetime:150000:0"))
+    for r in get_prime_prices():
+        b.row(InlineKeyboardButton(text=f"{r['plan_name']} — {r['price']:,} so'm", callback_data=f"prime:{r['plan_key']}"))
+    return b.as_markup()
+
+def pricing_keyboard():
+    b = InlineKeyboardBuilder()
+    for r in get_prime_prices():
+        b.row(InlineKeyboardButton(text=f"{r['plan_name']} — {r['price']:,} so'm", callback_data=f"price:{r['plan_key']}"))
+    b.row(InlineKeyboardButton(text="↩️ Standart narxlarga qaytarish", callback_data="price:reset"))
     return b.as_markup()
 
 
@@ -480,6 +518,15 @@ class PaymentState(StatesGroup):
     screenshot = State()
 class OrderState(StatesGroup):
     text = State()
+class BroadcastState(StatesGroup):
+    content = State()
+    confirm = State()
+
+class PriceState(StatesGroup):
+    price = State()
+
+class UserSearchState(StatesGroup):
+    query = State()
 
 
 async def subscribed(bot, user_id):
@@ -554,14 +601,14 @@ class ActiveStateLockMiddleware(BaseMiddleware):
     MENU_TEXTS = {
         "🔎 Kino qidirish", "⭐ Prime status", "📚 Kinolar ro'yxati",
         "📸 Instagramga qaytish", "🎬 Kino buyurtma qilish",
-        "🤝 Reklama & Bot olish", "🎬 Kino boshqaruvi",
+        "🤝 Reklama & Bot olish", "🤝 Reklama xizmati", "🎬 Kino boshqaruvi",
         "➕ Kino qo'shish", "✏️ Kino tahrirlash", "🗑 Kino o'chirish",
         "📚 Kinolar", "📊 Statistika", "💳 Karta sozlamalari",
-        "📢 Kanallar", "🔗 Mening referralim", "👥 Adminlar",
+        "📢 Kanallar", "🔗 Mening referralim", "👥 Adminlar", "📨 Foydalanuvchilarga xabar", "🏷 Aksiya / Narxlar", "💰 To'lovlar", "🛠 Texnik",
         "➕ Admin qo'shish", "🗑 Admin o'chirish", "📋 Adminlar",
         "➕ Karta qo'shish", "🔄 Kartani almashtirish",
         "👀 Hozirgi kartani ko'rish", "🗑 Kartani o'chirish",
-        "➕ Kanal qo'shish", "🗑 Kanal o'chirish", "📋 Kanallar",
+        "➕ Kanal qo'shish", "🗑 Kanal o'chirish", "📋 Kanallar", "🔎 Kino qidirish",
         "⬅️ Admin panel",
     }
 
@@ -580,6 +627,8 @@ class ActiveStateLockMiddleware(BaseMiddleware):
             if current == MovieAddState.type.state and (event.data or "").startswith("movie_type:"):
                 return await handler(event, data)
             if current in {MovieEditState.menu.state, MovieEditState.link.state, MovieEditState.type.state, MovieDeleteState.confirm.state} and (event.data or "").startswith(("movie_edit:", "movie_delete:")):
+                return await handler(event, data)
+            if current == BroadcastState.confirm.state and (event.data or "").startswith("broadcast:"):
                 return await handler(event, data)
             await event.answer("⏳ Avval joriy jarayonni tugating yoki ❌ Bekor qilishni bosing.", show_alert=True)
             return
@@ -679,39 +728,46 @@ async def deliver_movie(message: Message, movie):
 async def search_code(message: Message, state: FSMContext):
     query = message.text.strip()
     if not query:
-        await message.answer("❌ Kino kodi yoki kino nomini yuboring.")
-        return
-
-    movie = None
-    # Kino kodi faqat 3 xonali raqam. Qidiruv esa so'z va sonlarni ham qabul qiladi.
+        await message.answer("❌ Kino kodi yoki kino nomini yuboring."); return
     if query.isdigit() and len(query) == 3:
-        movie = DB.execute("SELECT * FROM movies WHERE code=?", (query,)).fetchone()
-    elif not query.isdigit():
-        movie = DB.execute(
-            "SELECT * FROM movies WHERE title ILIKE ? ORDER BY id DESC LIMIT 1",
-            (f"%{query}%",)
-        ).fetchone()
+        rows = DB.execute("SELECT * FROM movies WHERE code=? LIMIT 1", (query,)).fetchall()
     else:
-        # 3 xonali bo'lmagan son kino kodi emas. Uni nom ichidan qidiramiz.
-        movie = DB.execute(
-            "SELECT * FROM movies WHERE title ILIKE ? ORDER BY id DESC LIMIT 1",
-            (f"%{query}%",)
-        ).fetchone()
-
-    if not movie:
-        await message.answer("❌ Bunday kino topilmadi. Qayta urinib ko'ring.")
-        return
-    if movie["prime_only"] and not active_prime(message.from_user.id) and not is_admin_id(message.from_user.id):
-        await message.answer("⭐ Bu kino faqat Prime uchun.")
-        return
-    DB.execute("UPDATE movies SET views=views+1 WHERE id=?", (movie["id"],))
-    DB.commit()
-    try:
-        await deliver_movie(message, movie)
-    except Exception:
-        logger.exception("Kino yuborishda xato")
-        await message.answer("❌ Kino/linkni yuborishda xatolik yuz berdi.")
+        rows = DB.execute("SELECT * FROM movies WHERE title ILIKE ? ORDER BY id DESC LIMIT 10", (f"%{query}%",)).fetchall()
+    if not rows:
+        await message.answer("❌ Bunday kino topilmadi. Qayta urinib ko'ring."); return
     await state.clear()
+    if len(rows) == 1:
+        movie = rows[0]
+        if movie["prime_only"] and not active_prime(message.from_user.id) and not is_admin_id(message.from_user.id):
+            await message.answer("⭐ Bu kino faqat Prime uchun."); return
+        DB.execute("UPDATE movies SET views=views+1 WHERE id=?", (movie["id"],)); DB.commit()
+        try: await deliver_movie(message, movie)
+        except Exception:
+            logger.exception("Kino yuborishda xato"); await message.answer("❌ Kino/linkni yuborishda xatolik yuz berdi.")
+        return
+    b = InlineKeyboardBuilder()
+    for movie in rows:
+        label = f"{'⭐' if movie['prime_only'] else '🎬'} {movie['title'][:45]} — {movie['code']}"
+        b.row(InlineKeyboardButton(text=label, callback_data=f"movie_result:{movie['id']}"))
+    await message.answer(f"🔎 '{escape(query)}' bo'yicha topilgan kinolar:", reply_markup=b.as_markup())
+
+@router.callback_query(F.data.startswith("movie_result:"))
+async def movie_result(callback: CallbackQuery):
+    try: movie_id = int(callback.data.split(":", 1)[1])
+    except (ValueError, IndexError):
+        await callback.answer("❌ Kino ID xato.", show_alert=True); return
+    movie = DB.execute("SELECT * FROM movies WHERE id=?", (movie_id,)).fetchone()
+    if not movie:
+        await callback.answer("❌ Kino topilmadi.", show_alert=True); return
+    if movie["prime_only"] and not active_prime(callback.from_user.id) and not is_admin_id(callback.from_user.id):
+        await callback.answer("⭐ Bu kino faqat Prime uchun.", show_alert=True); return
+    DB.execute("UPDATE movies SET views=views+1 WHERE id=?", (movie_id,)); DB.commit()
+    await callback.answer()
+    try:
+        await deliver_movie(callback.message, movie)
+    except Exception:
+        logger.exception("Search result kino yuborishda xato")
+        await callback.message.answer("❌ Kino/linkni yuborishda xatolik yuz berdi.")
 
 
 @router.message(MovieAddState.code, F.text, ~F.text.in_({"⬅️ Orqaga", "❌ Bekor qilish"}))
@@ -1314,6 +1370,10 @@ async def back_any(message: Message, state: FSMContext):
         await state.clear(); await message.answer("👥 Adminlar", reply_markup=admin_manage_menu())
     elif current in {ChannelAddState.username.state, ChannelDeleteState.username.state}:
         await state.clear(); await message.answer("📢 Kanallar", reply_markup=channel_menu())
+    elif current in {BroadcastState.content.state, BroadcastState.confirm.state}:
+        await state.clear(); await message.answer("📨 Xabar yuborish bekor qilindi.", reply_markup=admin_menu(message.from_user))
+    elif current == PriceState.price.state:
+        await state.clear(); await message.answer("🏷 Narx o'zgartirish bekor qilindi.", reply_markup=admin_menu(message.from_user))
     else:
         await state.clear(); await send_main(message)
 
@@ -1331,55 +1391,80 @@ async def search_start(message: Message, state: FSMContext):
 async def prime_status(message: Message):
     row = get_user(message.from_user.id)
     if active_prime(message.from_user.id):
-        await message.answer(f"⭐ Prime status\n\n✅ Faol\n\n📅 Tugash sanasi:\n{prime_until_text(row['prime_until'])}")
+        try:
+            end = datetime.fromisoformat(row["prime_until"])
+            days_left = max(0, (end - datetime.now(timezone.utc).replace(tzinfo=None)).days)
+        except (ValueError, TypeError):
+            days_left = 0
+        await message.answer(f"⭐ Prime status\n\n✅ Faol\n⏳ Qolgan vaqt: {days_left} kun\n\n📅 Tugash sanasi:\n{prime_until_text(row['prime_until'])}")
     else:
-        await message.answer("⭐ Prime status\n\n❌ Prime faol emas.", reply_markup=prime_keyboard())
+        await message.answer("⭐ Prime status\n\n❌ Prime faol emas.\n\nQuyidagi tariflardan birini tanlang:", reply_markup=prime_keyboard())
 
 
 @router.callback_query(F.data.startswith("prime:"))
 async def choose_prime(callback: CallbackQuery, state: FSMContext):
-    try:
-        _, plan, price, days = callback.data.split(":")
-        price, days = int(price), int(days)
-    except ValueError:
+    parts = callback.data.split(":")
+    if len(parts) != 2:
         await callback.answer("❌ Tarif xato.", show_alert=True); return
+    plan_key = parts[1]
+    row = DB.execute("SELECT * FROM prime_prices WHERE plan_key=?", (plan_key,)).fetchone()
+    if not row:
+        await callback.answer("❌ Bu tarif mavjud emas.", show_alert=True); return
     admin_id = get_referral_admin(callback.from_user.id) or get_superadmin_id()
     if not admin_id:
         await callback.answer("❌ Mas'ul admin aniqlanmadi.", show_alert=True); return
     card = get_admin_card(admin_id)
     if not card:
         await callback.answer("❌ Mas'ul adminning kartasi sozlanmagan.", show_alert=True); return
-    plan_name = {"7":"7 kun", "1oy":"1 oy", "3oy":"3 oy", "lifetime":"Umrbod"}[plan]
     await state.set_state(PaymentState.screenshot)
-    await state.update_data(admin_id=admin_id, plan=plan_name, days=days, price=price)
+    await state.update_data(admin_id=admin_id, plan=row["plan_name"], days=row["days"], price=row["price"], plan_key=plan_key)
     await callback.answer()
-    await callback.message.answer(f"💳 To'lov ma'lumotlari\n\n💳 Karta: {escape(card['card_number'])}\n👤 Egasi: {escape(card['card_owner'])}\n💰 Narx: {price:,} so'm\n\n📸 To'lov screenshotini RASM ko'rinishida yuboring.", reply_markup=back_cancel())
+    await callback.message.answer(f"💳 To'lov ma'lumotlari\n\n💳 Karta: {escape(card['card_number'])}\n👤 Egasi: {escape(card['card_owner'])}\n💰 Narx: {row['price']:,} so'm\n\n📸 To'lov screenshotini RASM ko'rinishida yuboring.", reply_markup=back_cancel())
 
+
+def user_movie_page_keyboard(page, total_pages):
+    b = InlineKeyboardBuilder()
+    row = []
+    if page > 0:
+        row.append(InlineKeyboardButton(text="⬅️", callback_data=f"umovies:{page-1}"))
+    row.append(InlineKeyboardButton(text=f"{page+1}/{total_pages}", callback_data="umovies:noop"))
+    if page + 1 < total_pages:
+        row.append(InlineKeyboardButton(text="➡️", callback_data=f"umovies:{page+1}"))
+    b.row(*row)
+    return b.as_markup()
+
+async def render_user_movies(target, page=0):
+    per_page = 10
+    total = DB.execute("SELECT COUNT(*) c FROM movies").fetchone()["c"]
+    if not total:
+        await target.answer("📚 Hozircha kinolar mavjud emas.")
+        return
+    total_pages = (total + per_page - 1) // per_page
+    page = max(0, min(page, total_pages - 1))
+    rows = DB.execute("SELECT * FROM movies ORDER BY id DESC LIMIT ? OFFSET ?", (per_page, page * per_page)).fetchall()
+    blocks = [f"{'⭐' if r['prime_only'] else '🎬'} {escape(r['title'])}\n🔢 Kod: {escape(r['code'])} | 👁 {r['views']}" for r in rows]
+    text = f"📚 Kinolar ro'yxati — {page+1}/{total_pages}\n\n" + "\n\n".join(blocks)
+    await target.answer(text, reply_markup=user_movie_page_keyboard(page, total_pages))
 
 @router.message(StateFilter(None), F.text == "📚 Kinolar ro'yxati")
 async def user_movies(message: Message):
-    rows = DB.execute("SELECT * FROM movies ORDER BY id DESC").fetchall()
-    if not rows:
-        await message.answer("📚 Hozircha kinolar mavjud emas.")
-        return
-    blocks = [
-        f"{'⭐' if r['prime_only'] else '🎬'} {escape(r['title'])}\n🔢 Kod: {escape(r['code'])} | 👁 {r['views']}"
-        for r in rows
-    ]
-    chunks, current = [], ""
-    for block in blocks:
-        candidate = block if not current else current + "\n\n" + block
-        if len(candidate) > 3500:
-            if current:
-                chunks.append(current)
-            current = block
-        else:
-            current = candidate
-    if current:
-        chunks.append(current)
-    for i, chunk in enumerate(chunks, 1):
-        prefix = f"📚 Kinolar ro'yxati — {i}/{len(chunks)}\n\n" if len(chunks) > 1 else "📚 Kinolar ro'yxati\n\n"
-        await message.answer(prefix + chunk)
+    await render_user_movies(message, 0)
+
+@router.callback_query(F.data.startswith("umovies:"))
+async def user_movies_page(callback: CallbackQuery):
+    if callback.data == "umovies:noop":
+        await callback.answer(); return
+    try: page = int(callback.data.split(":")[1])
+    except (ValueError, IndexError):
+        await callback.answer("❌ Sahifa xato.", show_alert=True); return
+    total = DB.execute("SELECT COUNT(*) c FROM movies").fetchone()["c"]
+    total_pages = max(1, (total + 9) // 10)
+    page = max(0, min(page, total_pages - 1))
+    per_page = 10
+    rows = DB.execute("SELECT * FROM movies ORDER BY id DESC LIMIT ? OFFSET ?", (per_page, page * per_page)).fetchall()
+    text = f"📚 Kinolar ro'yxati — {page+1}/{total_pages}\n\n" + "\n\n".join(f"{'⭐' if r['prime_only'] else '🎬'} {escape(r['title'])}\n🔢 Kod: {escape(r['code'])} | 👁 {r['views']}" for r in rows)
+    await callback.message.edit_text(text, reply_markup=user_movie_page_keyboard(page, total_pages))
+    await callback.answer()
 
 
 @router.message(StateFilter(None), F.text == "📸 Instagramga qaytish")
@@ -1394,9 +1479,187 @@ async def order_start(message: Message, state: FSMContext):
     await message.answer("🎬 Qanday kino kerakligini yozib yuboring.", reply_markup=back_cancel())
 
 
-@router.message(StateFilter(None), F.text == "🤝 Reklama & Bot olish")
+@router.message(StateFilter(None), F.text.in_({"🤝 Reklama & Bot olish", "🤝 Reklama xizmati"}))
 async def ads(message: Message):
     await message.answer("🤝 Reklama & Bot olish\n\nAdmin: @omono_v")
+
+
+# =========================
+# SUPERADMIN BROADCAST / PRICING / TECHNICAL TOOLS
+# =========================
+def broadcast_target_keyboard():
+    b = InlineKeyboardBuilder()
+    b.row(InlineKeyboardButton(text="👥 Barcha userlar", callback_data="broadcast_target:all"))
+    b.row(InlineKeyboardButton(text="⭐ Faqat Prime", callback_data="broadcast_target:prime"), InlineKeyboardButton(text="🆓 Oddiy userlar", callback_data="broadcast_target:regular"))
+    return b.as_markup()
+
+def broadcast_confirm_keyboard():
+    b = InlineKeyboardBuilder()
+    b.row(InlineKeyboardButton(text="✅ Yuborish", callback_data="broadcast:send"), InlineKeyboardButton(text="❌ Bekor qilish", callback_data="broadcast:cancel"))
+    return b.as_markup()
+
+def price_reset_defaults():
+    return [("7", "7 kun", 7000, 7), ("1oy", "1 oy", 20000, 30), ("3oy", "3 oy", 50000, 90), ("lifetime", "Umrbod", 150000, 0)]
+
+@router.message(StateFilter(None), F.text == "📨 Foydalanuvchilarga xabar")
+async def broadcast_start(message: Message, state: FSMContext):
+    if not is_superadmin_user(message.from_user):
+        await message.answer("❌ Bu bo'lim faqat superadmin uchun."); return
+    await state.clear()
+    await message.answer("📨 Xabar kimlarga yuborilsin?", reply_markup=broadcast_target_keyboard())
+
+@router.callback_query(F.data.startswith("broadcast_target:"))
+async def broadcast_target(callback: CallbackQuery, state: FSMContext):
+    if not is_superadmin_user(callback.from_user):
+        await callback.answer("❌ Ruxsat yo'q.", show_alert=True); return
+    target = callback.data.split(":", 1)[1]
+    if target not in {"all", "prime", "regular"}:
+        await callback.answer("❌ Segment xato.", show_alert=True); return
+    await state.set_state(BroadcastState.content)
+    await state.update_data(target=target)
+    await callback.answer()
+    await callback.message.answer("📝 Endi xabarni yuboring.\n\n🖼 RASM + MATN yoki faqat MATN yuborishingiz mumkin.", reply_markup=back_cancel())
+
+@router.message(BroadcastState.content, F.photo)
+async def broadcast_photo(message: Message, state: FSMContext):
+    await state.update_data(source_chat_id=message.chat.id, source_message_id=message.message_id, kind="photo")
+    data = await state.get_data()
+    await state.set_state(BroadcastState.confirm)
+    await message.answer("👁 Xabar preview yuqorida.\n\nYuborishni tasdiqlaysizmi?", reply_markup=broadcast_confirm_keyboard())
+
+@router.message(BroadcastState.content, F.text, ~F.text.in_({"⬅️ Orqaga", "❌ Bekor qilish"}))
+async def broadcast_text(message: Message, state: FSMContext):
+    if not message.text.strip():
+        await message.answer("❌ Bo'sh xabar yuborib bo'lmaydi."); return
+    await state.update_data(source_chat_id=message.chat.id, source_message_id=message.message_id, kind="text")
+    await state.set_state(BroadcastState.confirm)
+    await message.answer("👁 Xabar preview yuqorida.\n\nYuborishni tasdiqlaysizmi?", reply_markup=broadcast_confirm_keyboard())
+
+@router.message(BroadcastState.content)
+async def broadcast_wrong_content(message: Message):
+    await message.answer("❌ Faqat rasm + matn yoki oddiy matn yuboring.")
+
+@router.callback_query(BroadcastState.confirm, F.data == "broadcast:cancel")
+async def broadcast_cancel(callback: CallbackQuery, state: FSMContext):
+    await state.clear(); await callback.answer("Bekor qilindi."); await callback.message.answer("❌ Broadcast bekor qilindi.", reply_markup=admin_menu(callback.from_user))
+
+@router.callback_query(BroadcastState.confirm, F.data == "broadcast:send")
+async def broadcast_send(callback: CallbackQuery, state: FSMContext, bot: Bot):
+    if not is_superadmin_user(callback.from_user):
+        await callback.answer("❌ Ruxsat yo'q.", show_alert=True); return
+    data = await state.get_data()
+    target = data.get("target", "all")
+    source_chat_id = data.get("source_chat_id")
+    source_message_id = data.get("source_message_id")
+    if not source_chat_id or not source_message_id:
+        await state.clear(); await callback.answer("❌ Xabar topilmadi.", show_alert=True); return
+    if target == "prime":
+        users = DB.execute("SELECT user_id FROM users WHERE prime_until IS NOT NULL AND prime_until > ? ORDER BY user_id", (now(),)).fetchall()
+    elif target == "regular":
+        users = DB.execute("SELECT user_id FROM users WHERE prime_until IS NULL OR prime_until <= ? ORDER BY user_id", (now(),)).fetchall()
+    else:
+        users = DB.execute("SELECT user_id FROM users ORDER BY user_id").fetchall()
+    total = len(users); sent = 0; failed = 0
+    await callback.answer("📨 Yuborish boshlandi...")
+    try:
+        await callback.message.edit_reply_markup(reply_markup=None)
+    except Exception: pass
+    for index, row in enumerate(users, 1):
+        uid = row["user_id"]
+        try:
+            await bot.copy_message(chat_id=uid, from_chat_id=source_chat_id, message_id=source_message_id)
+            sent += 1
+            await asyncio.sleep(0.04)
+        except Exception as exc:
+            failed += 1
+            logger.warning("Broadcast failed user=%s: %s", uid, exc)
+        if index % 100 == 0:
+            await asyncio.sleep(1)
+    await state.clear()
+    await callback.message.answer(f"✅ Broadcast tugadi.\n\n👥 Jami: {total}\n📨 Yetkazildi: {sent}\n❌ Yetkazilmadi: {failed}", reply_markup=admin_menu(callback.from_user))
+
+@router.message(StateFilter(None), F.text == "🏷 Aksiya / Narxlar")
+async def pricing_start(message: Message, state: FSMContext):
+    if not is_superadmin_user(message.from_user):
+        await message.answer("❌ Bu bo'lim faqat superadmin uchun."); return
+    await state.clear()
+    lines = [f"🏷 PRIME NARXLARI\n"] + [f"{r['plan_name']}: {r['price']:,} so'm" for r in get_prime_prices()]
+    await message.answer("\n".join(lines) + "\n\nO'zgartirish uchun tarifni tanlang:", reply_markup=pricing_keyboard())
+
+@router.callback_query(F.data == "price:reset")
+async def price_reset(callback: CallbackQuery):
+    if not is_superadmin_user(callback.from_user):
+        await callback.answer("❌ Ruxsat yo'q.", show_alert=True); return
+    for key, name, price, days in price_reset_defaults():
+        DB.execute("UPDATE prime_prices SET plan_name=?, price=?, days=?, updated_at=? WHERE plan_key=?", (name, price, days, now(), key))
+    DB.commit()
+    await callback.answer("✅ Standart narxlar tiklandi.", show_alert=True)
+    await callback.message.edit_text("🏷 Standart narxlar tiklandi.\n\n" + "\n".join(f"{r['plan_name']}: {r['price']:,} so'm" for r in get_prime_prices()), reply_markup=pricing_keyboard())
+
+@router.callback_query(F.data.startswith("price:"))
+async def price_choose(callback: CallbackQuery, state: FSMContext):
+    if not is_superadmin_user(callback.from_user):
+        await callback.answer("❌ Ruxsat yo'q.", show_alert=True); return
+    key = callback.data.split(":", 1)[1]
+    if key == "reset": return
+    row = DB.execute("SELECT * FROM prime_prices WHERE plan_key=?", (key,)).fetchone()
+    if not row:
+        await callback.answer("❌ Tarif topilmadi.", show_alert=True); return
+    await state.set_state(PriceState.price)
+    await state.update_data(plan_key=key)
+    await callback.answer()
+    await callback.message.answer(f"🏷 {row['plan_name']}\n\nHozirgi narx: {row['price']:,} so'm\n\nYangi narxni faqat raqam bilan yuboring.\nMasalan: 5000", reply_markup=back_cancel())
+
+@router.message(PriceState.price, F.text, ~F.text.in_({"⬅️ Orqaga", "❌ Bekor qilish"}))
+async def price_save(message: Message, state: FSMContext):
+    raw = message.text.replace(" ", "").replace(",", "").replace(".", "")
+    if not raw.isdigit():
+        await message.answer("❌ Narx faqat raqam bo'lishi kerak. Masalan: 5000"); return
+    price = int(raw)
+    if price < 0 or price > 100000000:
+        await message.answer("❌ Narx 0 dan 100 000 000 so'mgacha bo'lishi kerak."); return
+    data = await state.get_data(); key = data.get("plan_key")
+    DB.execute("UPDATE prime_prices SET price=?, updated_at=? WHERE plan_key=?", (price, now(), key)); DB.commit()
+    await state.clear()
+    await message.answer(f"✅ Narx saqlandi: {price:,} so'm", reply_markup=admin_menu(message.from_user))
+
+@router.message(StateFilter(None), F.text == "💰 To'lovlar")
+async def payments_menu(message: Message):
+    if not is_admin_user(message.from_user): return
+    aid = message.from_user.id
+    if is_superadmin_user(message.from_user):
+        rows = DB.execute("SELECT * FROM payments WHERE status='pending' ORDER BY id DESC LIMIT 20").fetchall()
+    else:
+        rows = DB.execute("SELECT * FROM payments WHERE status='pending' AND admin_id=? ORDER BY id DESC LIMIT 20", (aid,)).fetchall()
+    if not rows:
+        await message.answer("💰 Kutilayotgan to'lovlar yo'q.", reply_markup=admin_menu(message.from_user)); return
+    text = "💰 KUTILAYOTGAN TO'LOVLAR\n\n" + "\n\n".join(f"🧾 #{r['id']}\n👤 {r['user_id']}\n📦 {escape(r['plan'])}\n💰 {r['price']:,} so'm" for r in rows)
+    await message.answer(text + "\n\nTasdiqlash/rad etish tugmalari to'lov yuborilgan xabarning o'zida mavjud.", reply_markup=admin_menu(message.from_user))
+
+@router.message(StateFilter(None), F.text == "🛠 Texnik")
+async def technical_menu(message: Message):
+    if not is_superadmin_user(message.from_user):
+        await message.answer("❌ Bu bo'lim faqat superadmin uchun."); return
+    b = InlineKeyboardBuilder()
+    b.row(InlineKeyboardButton(text="📤 CSV eksport", callback_data="tech:export"))
+    await message.answer("🛠 Texnik bo'lim\n\n📤 Foydalanuvchilar, kinolar va to'lovlar ma'lumotini CSV ko'rinishida eksport qilishingiz mumkin.", reply_markup=b.as_markup())
+
+@router.callback_query(F.data == "tech:export")
+async def technical_export(callback: CallbackQuery, bot: Bot):
+    if not is_superadmin_user(callback.from_user):
+        await callback.answer("❌ Ruxsat yo'q.", show_alert=True); return
+    tables = [("users", "SELECT * FROM users ORDER BY user_id"), ("movies", "SELECT * FROM movies ORDER BY id"), ("payments", "SELECT * FROM payments ORDER BY id")]
+    await callback.answer("📤 Eksport tayyorlanmoqda...")
+    for name, query in tables:
+        rows = DB.execute(query).fetchall()
+        if not rows:
+            continue
+        out = io.StringIO(); writer = csv.writer(out)
+        headers = list(rows[0].keys()); writer.writerow(headers)
+        for row in rows: writer.writerow([row[h] for h in headers])
+        data = out.getvalue().encode("utf-8-sig")
+        await bot.send_document(callback.from_user.id, BufferedInputFile(data, filename=f"kinocinema_{name}.csv"))
+    await bot.send_message(callback.from_user.id, "✅ CSV eksport tugadi.", reply_markup=admin_menu(callback.from_user))
 
 # =========================
 # NO-STATE ADMIN MENU
@@ -1549,14 +1812,18 @@ async def stats(message: Message):
     revenue = DB.execute("SELECT COALESCE(SUM(price),0) s FROM payments WHERE admin_id=? AND status='approved'", (aid,)).fetchone()["s"]
     approved = DB.execute("SELECT COUNT(*) c FROM payments WHERE admin_id=? AND status='approved'", (aid,)).fetchone()["c"]
     pending = DB.execute("SELECT COUNT(*) c FROM payments WHERE admin_id=? AND status='pending'", (aid,)).fetchone()["c"]
-    text = f"📊 Statistika\n\n👥 Sizning referral orqali kirganlar: {refs}\n💰 Tasdiqlangan Prime tushumi: {revenue:,} so'm\n📦 Tasdiqlangan to'lovlar: {approved}\n📦 Kutilayotgan to'lovlar: {pending}"
+    text = f"📊 Statistika\n\n👥 Sizning referral orqali kirganlar: {refs}\n💰 Tasdiqlangan Prime tushumi: {revenue:,} so'm\n📦 Tasdiqlangan to'lovlar: {approved}\n⏳ Kutilayotgan to'lovlar: {pending}"
     if is_superadmin_user(message.from_user):
         users = DB.execute("SELECT COUNT(*) c FROM users").fetchone()["c"]
         movies = DB.execute("SELECT COUNT(*) c FROM movies").fetchone()["c"]
         primes = DB.execute("SELECT COUNT(*) c FROM users WHERE prime_until IS NOT NULL AND prime_until > ?", (now(),)).fetchone()["c"]
         total = DB.execute("SELECT COALESCE(SUM(price),0) s FROM payments WHERE status='approved'").fetchone()["s"]
         admins = DB.execute("SELECT COUNT(*) c FROM admins").fetchone()["c"]
-        text += f"\n\n🌐 Umumiy statistika\n\n👥 Umumiy foydalanuvchilar: {users}\n🎬 Kinolar: {movies}\n⭐ Prime userlar: {primes}\n💰 Umumiy tushum: {total:,} so'm\n👥 Adminlar: {admins}"
+        views = DB.execute("SELECT COALESCE(SUM(views),0) s FROM movies").fetchone()["s"]
+        top = DB.execute("SELECT title,code,views FROM movies ORDER BY views DESC,id DESC LIMIT 10").fetchall()
+        text += f"\n\n🌐 Umumiy statistika\n\n👥 Foydalanuvchilar: {users}\n🎬 Kinolar: {movies}\n⭐ Faol Prime userlar: {primes}\n💰 Umumiy tushum: {total:,} so'm\n👁 Jami ko'rishlar: {views}\n👥 Adminlar: {admins}"
+        if top:
+            text += "\n\n🔥 TOP 10 KINO\n" + "\n".join(f"{i}. {escape(r['title'])} — {r['views']} ko'rish" for i,r in enumerate(top,1))
     await message.answer(text)
 
 
